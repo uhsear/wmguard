@@ -8,7 +8,9 @@ frozenmark: the mark is read from MAX(stamp) of a table that stopped moving. On 
 traditionally versioned table the base table changes only when a compress moves
 the delta rows into it, so a blocked compress freezes MAX(stamp) while the _evw
 view keeps growing. The mark freezes with it, the job selects nothing, and "zero
-pending" is true of a table that has stopped telling the truth.
+pending" is true of a table that has stopped telling the truth. A base MAX that
+lags its view by a little is normal between compresses, so the tool flags
+FROZEN only when the base MAX is also older than --max-age-hours.
 
 safemark: the mark is advanced to a value that is not safe. Selection is strictly
 stamp > mark, so every unapplied row stamped at or below the new mark is gone for
@@ -24,8 +26,9 @@ Reads timestamps and CSV files. Opens no connection to anything. The only thing
 it writes is the --out CSV, and only with --apply.
 
 Exit codes: 0 nothing found, 1 at least one finding, 2 a file could not be read
-or written, 4 nothing was compared (the source had no row with a readable
-stamp), 64 usage error, 70 an unexpected crash, which is never a finding.
+or written, 4 nothing was compared (no source row could be judged, or no applied
+row was readable), 64 usage error, 70 an unexpected crash, which is never a
+finding.
 """
 
 from __future__ import print_function
@@ -120,29 +123,47 @@ def judge_frozen(watermark, base_max, view_max, now, max_age):
     base_max is MAX(stamp) of the table the job reads. view_max is the same
     MAX read through the current-state view, or None when it was not given.
     max_age is a timedelta. Pure: no clock, no I/O.
+
+    One snapshot cannot show that a table stopped moving. A versioned base
+    table lags its view between compresses, so FROZEN needs three things at
+    once: the view is ahead, the base MAX is older than max_age, and the mark
+    sits at or behind the base MAX. A mark above the base MAX did not come
+    from the base table, so a job that reads the view is not flagged.
     """
     out = []
+    stale = now - base_max > max_age
     if view_max is not None and view_max > base_max:
         gap = hours(view_max - base_max)
-        if watermark < view_max:
+        ahead = ("the view MAX %s is %.1f h ahead of the base MAX %s"
+                 % (fmt_stamp(view_max), gap, fmt_stamp(base_max)))
+        if stale and watermark <= base_max:
             if watermark == base_max:
                 how = ("The watermark equals the base MAX, so a job that "
                        "reads the base table selects nothing")
             else:
-                how = ("The watermark is %.1f h behind the view MAX, and a "
-                       "job that reads the base table cannot reach the gap"
-                       % hours(view_max - watermark))
+                how = ("The watermark is behind the base MAX, and the base "
+                       "table does not hold the rows between its MAX and "
+                       "the view MAX")
             out.append(Finding(
                 "FROZEN", True,
-                "the view MAX %s is %.1f h ahead of the base MAX %s. %s."
-                % (fmt_stamp(view_max), gap, fmt_stamp(base_max), how)))
+                "%s, and the base MAX is %.1f h old, over the limit of "
+                "%.1f h. %s." % (ahead, hours(now - base_max),
+                                 hours(max_age), how)))
+        elif stale:
+            out.append(Finding(
+                "BASE_LAGS", False,
+                "%s, and the base MAX is %.1f h old. The watermark is above "
+                "the base MAX, so it did not come from the base table. "
+                "Anything else that reads the base table is stale."
+                % (ahead, hours(now - base_max))))
         else:
             out.append(Finding(
                 "BASE_LAGS", False,
-                "the base MAX is %.1f h behind the view MAX, but the "
-                "watermark is already at or past the view MAX. Anything "
-                "else that reads the base table is stale." % gap))
-    elif now - base_max > max_age:
+                "%s, and the base MAX is within the limit of %.1f h. A "
+                "versioned base table lags its view until the next "
+                "compress, so this alone is not a freeze."
+                % (ahead, hours(max_age))))
+    elif stale:
         age = hours(now - base_max)
         if view_max is None:
             out.append(Finding(
@@ -153,8 +174,8 @@ def judge_frozen(watermark, base_max, view_max, now, max_age):
         else:
             out.append(Finding(
                 "IDLE", False,
-                "the base MAX is %.1f h old, but the view agrees with it. "
-                "The table is quiet, not frozen." % age))
+                "the base MAX is %.1f h old, and the view MAX is not ahead "
+                "of it. The table is quiet, not frozen." % age))
     ceiling = base_max if view_max is None else max(base_max, view_max)
     if watermark > ceiling:
         out.append(Finding(
@@ -173,8 +194,9 @@ def judge_frozen(watermark, base_max, view_max, now, max_age):
 def build_applied(records, key_field, stamp_field):
     """(newest applied stamp by key, count of rows with no readable stamp).
 
-    A row with no readable stamp proves nothing was applied, so it is counted
-    and left out. A key applied twice keeps its newest stamp.
+    A row with no readable stamp or no key proves nothing was applied, so it is
+    counted and left out. A blank key must never match: it would mark every
+    blank-key source row applied. A key applied twice keeps its newest stamp.
     """
     applied = {}
     unreadable = 0
@@ -183,6 +205,9 @@ def build_applied(records, key_field, stamp_field):
         try:
             stamp = parse_stamp(rec.get(stamp_field))
         except ValueError:
+            unreadable += 1
+            continue
+        if not key:
             unreadable += 1
             continue
         previous = applied.get(key)
@@ -204,16 +229,24 @@ def build_source(records, key_field, stamp_field):
     return rows
 
 
+def is_applied(row, applied):
+    """True when the key was applied at the row's stamp or a newer one."""
+    done = applied.get(row.key)
+    return done is not None and done >= row.stamp
+
+
 def classify_row(row, applied, old, new):
     """One class per source row. The job selects strictly stamp > old, so a row
     is in play only above old, and it is lost when it is unapplied at or below
-    new."""
+    new. A row in play with a blank key cannot be matched to an applied row,
+    so it is UNDATED and never guessed APPLIED."""
     if row.stamp is None:
         return UNDATED
     if row.stamp <= old:
         return BEHIND
-    done = applied.get(row.key)
-    if done is not None and done >= row.stamp:
+    if not row.key:
+        return UNDATED
+    if is_applied(row, applied):
         return APPLIED
     if row.stamp <= new:
         return STRANDED
@@ -221,10 +254,11 @@ def classify_row(row, applied, old, new):
 
 
 def safe_watermark(rows, verdicts, old):
-    """The highest mark that skips no unapplied row.
+    """A mark that skips no unapplied row.
 
     Selection is strictly greater than the mark, so the mark must sit below the
-    oldest unapplied stamp. The newest applied stamp under that is the answer.
+    oldest unapplied stamp. The answer is the newest applied stamp under that,
+    or old when there is none. Any lower mark is safe too, only slower.
     An applied row that shares the oldest unapplied stamp is selected again
     next run, so the apply step has to be safe to repeat.
     """
@@ -238,9 +272,15 @@ def safe_watermark(rows, verdicts, old):
 
 
 class SafeReport(object):
-    """The result of judging one watermark advance."""
+    """The result of judging one watermark advance.
 
-    def __init__(self, rows, verdicts, old, new, safe, unreadable, findings):
+    why is None, or the reason nothing was compared. applied_unusable is True
+    when the applied file had rows and none could be read: every source row
+    would look unapplied, and that is a format fault, not a finding.
+    """
+
+    def __init__(self, rows, verdicts, old, new, safe, unreadable, findings,
+                 applied_unusable=False):
         self.rows = rows
         self.verdicts = verdicts
         self.old = old
@@ -248,28 +288,47 @@ class SafeReport(object):
         self.safe = safe
         self.unreadable = unreadable
         self.findings = findings
+        self.applied_unusable = applied_unusable
         self.counts = dict((c, verdicts.count(c)) for c in CLASSES)
         self.compared = len(verdicts) - self.counts[UNDATED]
+        self.why = None
+        if applied_unusable:
+            self.compared = 0
+            self.why = ("No applied row has a readable key and stamp, so "
+                        "every source row would look unapplied. Check the "
+                        "date format and the column names of the applied "
+                        "file.")
+        elif self.compared == 0:
+            self.why = ("No source row can be judged: each has a blank key "
+                        "or a stamp the tool cannot read, or the source has "
+                        "no row.")
 
 
 def judge_safe(rows, applied, unreadable, old, new):
-    """Judge the move of a watermark from old to new. Pure: no clock, no I/O."""
+    """Judge the move of a watermark from old to new. Pure: no clock, no I/O.
+
+    Only rows stamped above old are judged. unreadable is the count of applied
+    rows with no readable key and stamp."""
     verdicts = [classify_row(r, applied, old, new) for r in rows]
     safe = safe_watermark(rows, verdicts, old)
+    if unreadable and not applied:
+        return SafeReport(rows, verdicts, old, new, safe, unreadable, [],
+                          True)
     findings = []
     lost = verdicts.count(STRANDED)
     if lost:
         findings.append(Finding(
             "STRANDED", True,
             "the new watermark skips %d unapplied row(s). A job that selects "
-            "stamp > watermark never sees them again. The highest mark that "
-            "skips none is %s." % (lost, fmt_stamp(safe))))
+            "stamp > watermark never sees them again. A safe mark is %s."
+            % (lost, fmt_stamp(safe))))
     undated = verdicts.count(UNDATED)
     if undated:
         findings.append(Finding(
             "UNDATED", True,
-            "%d source row(s) have no readable stamp. A comparison with NULL "
-            "is never true, so stamp > watermark can never select them."
+            "%d source row(s) have a blank key or a stamp the tool cannot "
+            "read, so they are not judged. A NULL stamp is never greater "
+            "than a mark, and a stamp in another format is not read."
             % undated))
     dated = [r.stamp for r in rows if r.stamp is not None]
     if dated and new > max(dated):
@@ -283,9 +342,20 @@ def judge_safe(rows, applied, unreadable, old, new):
             "REGRESSED", False,
             "the new watermark is behind the old one, so rows between them "
             "are selected again. Safe only if applying a row twice is safe."))
-    if not findings:
+    compared = len(verdicts) - undated
+    if not findings and compared:
         findings.append(Finding(
-            "SAFE", False, "the new watermark skips no unapplied row."))
+            "SAFE", False, "the new watermark skips no unapplied row above "
+            "the old watermark."))
+    outside = sum(1 for r, v in zip(rows, verdicts)
+                  if v == BEHIND and not is_applied(r, applied))
+    if outside:
+        findings.append(Finding(
+            "OUTSIDE", False,
+            "%d unapplied row(s) have a stamp at or below the old "
+            "watermark, so this run does not judge them. An earlier run may "
+            "have skipped them. Pass an early --old-watermark, such as "
+            "1900-01-01, to judge the whole history." % outside))
     return SafeReport(rows, verdicts, old, new, safe, unreadable, findings)
 
 
@@ -301,14 +371,20 @@ def gate(findings, compared):
 
 # ------------------------------------------------------------------- reporting
 
-def verdict_line(findings, compared):
+def verdict_line(findings, why, clean):
+    """why is the reason nothing was compared, or None. clean is the sentence
+    for a run with no finding, which differs by mode."""
     count = sum(1 for f in findings if f.is_finding)
-    if compared == 0:
-        return ("VERDICT: nothing was compared. No source row has a readable "
-                "stamp, so this is not a clean run.")
+    if why:
+        return ("VERDICT: nothing was compared. %s This is not a clean run."
+                % why)
     if count:
         return "VERDICT: %d finding(s). Do not trust this watermark." % count
-    return "VERDICT: no freeze and no skipped row found."
+    return clean
+
+
+CLEAN_FROZEN = "VERDICT: no frozen MAX and no mark past the source found."
+CLEAN_SAFE = "VERDICT: no skipped row found above the old watermark."
 
 
 def describe_frozen(watermark, base_max, view_max, now, max_age):
@@ -320,7 +396,7 @@ def describe_frozen(watermark, base_max, view_max, now, max_age):
                 fmt_stamp(now), hours(max_age))]
     for f in findings:
         lines.append("%-9s %s" % (f.code, f.message))
-    lines.append(verdict_line(findings, 1))
+    lines.append(verdict_line(findings, None, CLEAN_FROZEN))
     return lines, gate(findings, 1)
 
 
@@ -340,17 +416,22 @@ def _sample_lines(report, verdict, sample):
 
 def describe_safe(report, sample):
     lines = ["window: stamp after %s, new watermark %s"
-             % (fmt_stamp(report.old), fmt_stamp(report.new)),
-             ", ".join("%s %d" % (c, report.counts[c]) for c in CLASSES)]
+             % (fmt_stamp(report.old), fmt_stamp(report.new))]
+    if report.applied_unusable:
+        lines.append("applied file: %d row(s), none with a readable key and "
+                     "stamp" % report.unreadable)
+        lines.append(verdict_line(report.findings, report.why, CLEAN_SAFE))
+        return lines
+    lines.append(", ".join("%s %d" % (c, report.counts[c]) for c in CLASSES))
     if report.unreadable:
-        lines.append("applied file: %d row(s) with no readable stamp were "
-                     "counted as not applied" % report.unreadable)
+        lines.append("applied file: %d row(s) with no readable key or stamp "
+                     "were counted as not applied" % report.unreadable)
     for f in report.findings:
         lines.append("%-9s %s" % (f.code, f.message))
     lines.extend(_sample_lines(report, STRANDED, sample))
     lines.extend(_sample_lines(report, UNDATED, sample))
     lines.append("safe watermark: %s" % fmt_stamp(report.safe))
-    lines.append(verdict_line(report.findings, report.compared))
+    lines.append(verdict_line(report.findings, report.why, CLEAN_SAFE))
     return lines
 
 
@@ -362,7 +443,9 @@ def classified_rows(report):
 
 
 def write_classified(path, report):
-    with open(path, "w", newline="", encoding="utf-8") as handle:
+    # "x", not "w": the file must not exist, so a path that appeared after
+    # the check in _run_safe still cannot be overwritten.
+    with open(path, "x", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, ["row", "key", "stamp", "class"])
         writer.writeheader()
         writer.writerows(classified_rows(report))
@@ -372,8 +455,14 @@ def write_classified(path, report):
 
 def read_csv(path, fields):
     """Rows of a CSV as dicts. Raises ValueError when a column is missing."""
-    # utf-8-sig, because Excel and Esri's table export both write a BOM, and
-    # read as plain UTF-8 the first header would not match its own name.
+    # A UTF-16 file has NUL bytes, which the csv module refuses on Python 3.9
+    # and 3.10 and reads as text on 3.11 and later. Say so before that matters.
+    with open(path, "rb") as fh:
+        if fh.read(2) in (b"\xff\xfe", b"\xfe\xff"):
+            raise ValueError("%s: this looks like a UTF-16 file. Export "
+                             "comma-separated UTF-8 text." % path)
+    # utf-8-sig removes a BOM when the file starts with one. Read as plain
+    # UTF-8 the BOM would stay in the first header and break its match.
     with open(path, newline="", encoding="utf-8-sig", errors="replace") as fh:
         reader = csv.DictReader(fh)
         header = [h.strip() for h in (reader.fieldnames or [])]
@@ -437,7 +526,10 @@ def _parse(argv):
 
 
 def _given(args, names):
-    return [n for n in names if getattr(args, n) not in (None, False)]
+    """Flags the operator typed. Identity tests, not ==, because 0 == False
+    and a zero value must count as given."""
+    return [n for n in names
+            if getattr(args, n) is not None and getattr(args, n) is not False]
 
 
 def _flag(name):
@@ -455,11 +547,6 @@ def _tolerate_odd_characters():
         reconfigure = getattr(stream, "reconfigure", None)
         if reconfigure:
             reconfigure(errors="replace")
-
-
-def _same_file(a, b):
-    return os.path.normcase(os.path.realpath(a)) == os.path.normcase(
-        os.path.realpath(b))
 
 
 def main(argv=None):
@@ -549,19 +636,24 @@ def _run_safe(args):
     sample = DEFAULT_SAMPLE if args.sample is None else args.sample
     if sample < 0:
         raise ValueError("--sample cannot be negative.")
+    for name in ("key_field", "stamp_field", "applied_key_field",
+                 "applied_stamp_field", "out"):
+        if getattr(args, name) == "":
+            raise ValueError("%s cannot be empty." % _flag(name))
     if args.apply and not args.out:
         raise ValueError("--apply needs --out.")
-    if args.out:
-        # Checked on a dry run too: the run that would clobber a layer should
-        # say so before --apply is added, not after.
-        for path in (args.source, args.applied):
-            if _same_file(args.out, path):
-                raise ValueError("--out %s is also an input file. Name a new "
-                                 "file." % args.out)
-    key = args.key_field or DEFAULT_KEY_FIELD
-    stamp = args.stamp_field or DEFAULT_STAMP_FIELD
-    akey = args.applied_key_field or key
-    astamp = args.applied_stamp_field or stamp
+    if args.out is not None and os.path.lexists(args.out):
+        # Checked on a dry run too: the run that would clobber a file should
+        # say so before --apply is added, not after. This covers the input
+        # files, hard links to them and every other existing path.
+        raise ValueError("--out %s already exists. wmguard never overwrites; "
+                         "name a new file." % args.out)
+    key = DEFAULT_KEY_FIELD if args.key_field is None else args.key_field
+    stamp = (DEFAULT_STAMP_FIELD if args.stamp_field is None
+             else args.stamp_field)
+    akey = key if args.applied_key_field is None else args.applied_key_field
+    astamp = (stamp if args.applied_stamp_field is None
+              else args.applied_stamp_field)
     try:
         source = read_csv(args.source, (key, stamp))
         applied_rows = read_csv(args.applied, (akey, astamp))
@@ -578,7 +670,7 @@ def _run_safe(args):
     for line in describe_safe(report, sample):
         print(line)
     code = gate(report.findings, report.compared)
-    if args.out:
+    if args.out is not None:
         if not args.apply:
             print("\nCheck only. %s was not written. Re-run with --apply."
                   % args.out)
@@ -678,6 +770,8 @@ def _self_test(tmp):
            "a numeric offset is refused too")
     raises(lambda: T(""), "an empty stamp is refused")
     raises(lambda: T(None), "a missing stamp is refused")
+    check(T("2026-3-1 8:30:00") == T("2026-03-01 08:30:00"),
+          "strptime also accepts a one-digit month, day and hour")
     raises(lambda: T("03/01/2026"),
            "a US date is refused, because its month and day are ambiguous")
     raises(lambda: T("2026-03-01 08:30:00.1234567"),
@@ -696,16 +790,52 @@ def _self_test(tmp):
     check("equals the base MAX" in f[0].message
           and "selects nothing" in f[0].message,
           "and the finding says the watermark came from the base MAX")
-    check("1328.5 h ahead" in f[0].message,
+    check("is 1328.5 h ahead" in f[0].message,
           "the gap between base and view is measured, 55 days 8.5 h")
     f = frozen("2026-01-04 00:00:00", "2026-01-05 00:00:00",
                "2026-03-01 08:30:00", "2026-03-01 09:00:00")
-    check(codes(f) == ["FROZEN"] and "behind the view MAX" in f[0].message,
-          "a watermark behind the base MAX is FROZEN too, a different cause")
+    check(codes(f) == ["FROZEN"] and "behind the base MAX" in f[0].message
+          and "cannot reach" not in f[0].message,
+          "a watermark behind a frozen base MAX is FROZEN too, a different "
+          "cause")
+    f = frozen("2026-03-01 00:00:00", "2026-03-01 08:00:00",
+               "2026-03-01 08:00:01", "2026-03-04 00:00:00")
+    check(codes(f) == ["FROZEN"] and "does not hold the rows between"
+          in f[0].message and "selects nothing" not in f[0].message,
+          "and its wording names only the part of the gap the base cannot "
+          "hold, not the rows the job still reads")
     f = frozen("2026-02-01 00:00:00", "2026-01-05 00:00:00",
                "2026-03-01 08:30:00", "2026-03-01 09:00:00")
-    check(codes(f) == ["FROZEN"] and "h behind the view MAX" in f[0].message,
-          "a watermark between the two MAX values is FROZEN")
+    check(codes(f) == ["BASE_LAGS"] and not f[0].is_finding
+          and "did not come from the base table" in f[0].message,
+          "a watermark above a stale base MAX did not come from the base: a "
+          "note, not a finding  <-- pinned defect")
+    f = frozen("2026-03-01 02:00:00", "2026-02-20 00:00:00",
+               "2026-03-01 08:30:00", "2026-03-01 09:00:00")
+    check(codes(f) == ["BASE_LAGS"] and not f[0].is_finding,
+          "a job that reads the view, whose mark trails the view MAX, is not "
+          "FROZEN  <-- pinned defect")
+    f = frozen("2026-03-01 08:00:00", "2026-03-01 08:00:00",
+               "2026-03-01 08:20:00", "2026-03-01 08:30:00")
+    check(codes(f) == ["BASE_LAGS"] and not f[0].is_finding
+          and "not a freeze" in f[0].message
+          and gate(f, 1) == 0,
+          "a base MAX inside the age limit that the view is ahead of is the "
+          "normal state between compresses: a note, exit 0  "
+          "<-- pinned defect")
+    f = frozen("2026-02-28 00:00:00", "2026-03-01 00:00:00",
+               "2026-03-01 00:00:01", "2026-03-01 00:10:00")
+    check(codes(f) == ["BASE_LAGS"],
+          "a mark 24 h behind a recent base MAX, with the view 1 s ahead, is "
+          "not FROZEN  <-- pinned defect")
+    f = frozen("2026-03-01 00:00:00", "2026-03-01 00:00:00",
+               "2026-03-01 00:05:00", "2026-03-03 00:00:00")
+    check(codes(f) == ["BASE_LAGS"],
+          "a base MAX exactly at the age limit is not frozen, the limit is "
+          "inclusive")
+    f = frozen("2026-03-01 00:00:00", "2026-03-01 00:00:00",
+               "2026-03-01 00:05:00", "2026-03-03 00:00:01")
+    check(codes(f) == ["FROZEN"], "and one second over it is FROZEN")
     f = frozen("2026-03-01 08:30:00", "2026-01-05 00:00:00",
                "2026-03-01 08:30:00", "2026-03-01 09:00:00")
     check(codes(f) == ["BASE_LAGS"] and not f[0].is_finding,
@@ -747,8 +877,9 @@ def _self_test(tmp):
     # ---- frozenmark: a quiet table is not a frozen one
     f = frozen("2026-01-05 00:00:00", "2026-01-05 00:00:00",
                "2026-01-05 00:00:00", "2026-03-01 09:00:00")
-    check(codes(f) == ["IDLE"] and not f[0].is_finding,
-          "an old base MAX that the view confirms is IDLE, a note  "
+    check(codes(f) == ["IDLE"] and not f[0].is_finding
+          and "not ahead of it" in f[0].message,
+          "an old base MAX that the view does not pass is IDLE, a note  "
           "<-- pinned defect")
     f = frozen("2026-01-05 00:00:00", "2026-01-05 00:00:00",
                "2026-01-04 00:00:00", "2026-03-01 09:00:00")
@@ -806,8 +937,14 @@ def _self_test(tmp):
           "<-- pinned defect")
     check(cls("A", "2026-03-01 00:30:00") == APPLIED,
           "a row applied at a newer stamp than the source shows is APPLIED")
-    check(cls("", "2026-03-01 02:00:00") == STRANDED,
-          "a blank key matches nothing applied")
+    check(cls("", "2026-03-01 02:00:00") == UNDATED,
+          "a row in the window with a blank key is UNDATED, never guessed "
+          "APPLIED  <-- pinned defect")
+    check(cls("", "2026-03-01 02:00:00", {"": T("2026-03-01 02:00:00")})
+          == UNDATED,
+          "and a blank key does not match a blank key in the applied map")
+    check(cls("", "2026-02-28 00:00:00") == BEHIND,
+          "a blank key below the old mark is outside the run: BEHIND")
 
     # ---- safemark: the safe watermark
     def judge(source, applied_map, o=old, n=new, unreadable=0):
@@ -844,6 +981,15 @@ def _self_test(tmp):
           "next run honest")
     r = judge([("B", "2026-03-01 02:00:00")], {})
     check(r.safe == old, "with nothing applied the safe mark is the old one")
+    r = judge([("A", "2026-03-01 01:00:00"), ("P", "2026-03-01 02:00:00"),
+               ("B", "2026-03-01 03:00:00")],
+              {"A": T("2026-03-01 01:00:00"), "B": T("2026-03-01 03:00:00")},
+              n=T("2026-03-01 01:30:00"))
+    check(r.verdicts == [APPLIED, PENDING, APPLIED]
+          and r.safe == T("2026-03-01 01:00:00"),
+          "an unapplied row above the new mark (PENDING) also caps the safe "
+          "mark: it never rises past a row the next run still needs  "
+          "<-- pinned defect")
     r = judge([("A", "2026-03-01 01:00:00"), ("B", "2026-03-01 02:00:00")],
               {"A": T("2026-03-01 01:00:00"), "B": T("2026-03-01 02:00:00")},
               o=T("2026-03-01 03:00:00"), n=T("2026-03-01 03:00:00"))
@@ -854,15 +1000,17 @@ def _self_test(tmp):
     r = judge([("A", "2026-03-01 01:00:00")],
               {"A": T("2026-03-01 01:00:00")},
               n=T("2026-03-01 09:00:00"))
-    check(codes(r.findings) == ["AHEAD"],
+    check(codes(r.findings) == ["AHEAD"] and r.findings[0].is_finding
+          and gate(r.findings, r.compared) == 1,
           "a mark past every source stamp is AHEAD even when nothing is "
-          "stranded  <-- pinned defect")
+          "stranded, and it exits 1  <-- pinned defect")
     r = judge([("A", "2026-03-01 01:00:00"), ("B", None)],
               {"A": T("2026-03-01 01:00:00")},
               n=T("2026-03-01 01:00:00"))
-    check(codes(r.findings) == ["UNDATED"],
+    check(codes(r.findings) == ["UNDATED"] and r.findings[0].is_finding
+          and gate(r.findings, r.compared) == 1,
           "a row with no stamp is a finding: stamp > mark is never true for "
-          "NULL  <-- pinned defect")
+          "NULL, and it exits 1  <-- pinned defect")
     check(r.compared == 1 and r.counts[UNDATED] == 1,
           "and it is not counted as compared")
     r = judge([("A", "2026-03-01 05:00:00")],
@@ -872,14 +1020,20 @@ def _self_test(tmp):
           "a mark moved backwards is a note: rows are selected twice, none "
           "lost")
     check(gate(r.findings, r.compared) == 0, "a regression alone exits 0")
+    r = judge([("A", "2026-03-01 05:00:00")],
+              {"A": T("2026-03-01 05:00:00")},
+              o=T("2026-03-01 04:00:00"), n=T("2026-03-01 04:00:00"))
+    check("REGRESSED" not in codes(r.findings),
+          "a new mark equal to the old one is not a regression")
     r = judge([("A", None)], {})
     check(r.compared == 0 and gate(r.findings, r.compared) == 4,
           "a source with no readable stamp compared nothing: exit 4, not "
           "clean  <-- pinned defect")
     r = judge([], {})
     check(r.compared == 0 and gate(r.findings, r.compared) == 4
-          and codes(r.findings) == ["SAFE"],
-          "an empty source is exit 4 as well, even though no finding fired")
+          and codes(r.findings) == [] and r.why is not None,
+          "an empty source is exit 4 as well, and prints no SAFE line "
+          "<-- pinned defect")
     check(gate([Finding("X", True, "")], 3) == 1
           and gate([Finding("X", False, "")], 3) == 0,
           "gate: a finding is 1, a note is 0")
@@ -891,6 +1045,38 @@ def _self_test(tmp):
                r.counts[BEHIND], r.counts[UNDATED]) == (1, 1, 1, 1, 1),
           "every source row lands in exactly one class and the counts add "
           "up")
+
+    # ---- rows at or below the old mark that were never applied
+    r = judge([("A", "2026-02-28 01:00:00"), ("B", "2026-02-28 02:00:00"),
+               ("C", "2026-03-01 01:00:00")],
+              {"B": T("2026-02-28 02:00:00"), "C": T("2026-03-01 01:00:00")},
+              n=T("2026-03-01 01:00:00"))
+    check(codes(r.findings) == ["SAFE", "OUTSIDE"]
+          and not r.findings[1].is_finding
+          and r.findings[1].message.startswith("1 unapplied row(s)")
+          and "1900-01-01" in r.findings[1].message
+          and gate(r.findings, r.compared) == 0,
+          "an unapplied row at or below the old mark is reported as a note, "
+          "not hidden behind a clean verdict  <-- pinned defect")
+    r = judge([("A", "2026-02-28 01:00:00")], {"A": T("2026-02-28 01:00:00")})
+    check("OUTSIDE" not in codes(r.findings),
+          "and an applied row below the old mark is not reported")
+    r = judge([("A", "2026-03-01 01:00:00"), ("", "2026-03-01 02:00:00"),
+               ("", "2026-03-01 03:00:00")],
+              {"A": T("2026-03-01 01:00:00")}, n=T("2026-03-01 03:00:00"))
+    check(r.verdicts == [APPLIED, UNDATED, UNDATED]
+          and gate(r.findings, r.compared) == 1,
+          "rows with a blank key are UNDATED and the run exits 1, not 0  "
+          "<-- pinned defect")
+    r = judge([("A", "2026-03-01 01:00:00")], {}, unreadable=2)
+    check(r.applied_unusable and r.compared == 0 and r.findings == []
+          and gate(r.findings, r.compared) == 4 and "date format" in r.why,
+          "an applied file with rows and none readable compares nothing, "
+          "instead of reporting every row STRANDED  <-- pinned defect")
+    r = judge([("A", "2026-03-01 01:00:00")],
+              {"B": T("2026-03-01 01:00:00")}, unreadable=2)
+    check(not r.applied_unusable and r.counts[STRANDED] == 1,
+          "an applied file with some readable rows is judged as usual")
 
     # ---- the applied side
     recs = [{"K": "A", "S": "2026-03-01 01:00:00"},
@@ -904,10 +1090,18 @@ def _self_test(tmp):
                   "D": T("2026-03-01 04:00:00")} and bad == 2,
           "a key applied twice keeps its newest stamp, an unreadable stamp "
           "is counted and left out, and keys are trimmed")
+    got, bad = build_applied([{"K": "  ", "S": "2026-03-01 01:00:00"},
+                              {"K": "", "S": "2026-03-01 02:00:00"}],
+                             "K", "S")
+    check(got == {} and bad == 2,
+          "an applied row with a blank key is counted and left out, so it "
+          "can never match  <-- pinned defect")
     check(build_applied([{"K": None, "S": None}], "K", "S") == ({}, 1),
           "a short row (None cells) is an unreadable applied row")
     src = build_source([{"K": "A", "S": "2026-03-01 01:00:00"},
                         {"K": None, "S": "x"}], "K", "S")
+    check(build_source([{"K": " A ", "S": "2026-03-01"}], "K", "S")[0].key
+          == "A", "source keys are trimmed too")
     check(src[0] == SourceRow(1, "A", T("2026-03-01 01:00:00"))
           and src[1] == SourceRow(2, "", None),
           "source rows are numbered from 1 and a bad stamp becomes None")
@@ -945,7 +1139,7 @@ def _self_test(tmp):
           "frozenmark with no view says so and exits 1 on a stale base")
     code, out, err = run_cli(fz + ["--view-max", "2026-01-05 00:00:00"])
     check(code == 0 and "IDLE" in out
-          and "VERDICT: no freeze and no skipped row found." in out,
+          and "VERDICT: no frozen MAX and no mark past the source found." in out,
           "an idle table exits 0")
     code, out, err = run_cli(fz + ["--max-age-hours", "100000"])
     check(code == 0 and "FRESH" in out and "100000.0 h" in out,
@@ -972,6 +1166,11 @@ def _self_test(tmp):
           "<-- pinned defect")
     check(run_cli(fz + ["--max-age-hours", "abc"])[0] == 64,
           "a non-number age limit is a usage error")
+    check(run_cli(fz + ["--max-age-hours", "0"])[0] == 1
+          and run_cli(fz + ["--max-age-hours", "1000000"])[0] == 0
+          and run_cli(fz + ["--max-age-hours", "1000000.5"])[0] == 64,
+          "the age limit 0 and the upper limit are accepted, and one step "
+          "past the upper limit is refused")
     code, out, err = run_cli(
         ["frozenmark", "--watermark", "yesterday", "--base-max",
          "2026-01-05"])
@@ -1006,7 +1205,7 @@ def _self_test(tmp):
           and "safe watermark: 2026-03-01 01:00:00" in out
           and "VERDICT: 1 finding(s)" in out,
           "safemark names the skipped row, the safe mark and exits 1")
-    check("applied file: 1 row(s) with no readable stamp" in out,
+    check("applied file: 1 row(s) with no readable key or stamp" in out,
           "and reports the applied rows it could not read")
     check(src_csv + " 5 row(s)" in out and app_csv + " 3 row(s)" in out,
           "and prints the row count of both files")
@@ -1024,6 +1223,12 @@ def _self_test(tmp):
          "2026-03-01 06:00:00", "--sample", "2"])
     check(code == 1 and "...and 3 more" in out,
           "a long list stops at --sample and says how many are left")
+    code, out, err = run_cli(
+        ["safemark", "--source", many, "--applied", app_csv,
+         "--old-watermark", "2026-03-01 00:00:00", "--new-watermark",
+         "2026-03-01 06:00:00", "--sample", "5"])
+    check(code == 1 and "STRANDED rows:" in out and "...and" not in out,
+          "a list exactly as long as --sample has no ...and line")
     code, out, err = run_cli(sw[:-1] + ["2026-03-01 09:00:00"])
     check(code == 1 and "AHEAD" in out,
           "a new mark past the source is AHEAD on the CLI")
@@ -1067,22 +1272,48 @@ def _self_test(tmp):
          "2026-03-01 01:00:00", "--out", nul_dest, "--apply"])
     check(code == 4 and not os.path.exists(nul_dest) and "Refused" in out,
           "a run that compared nothing writes nothing even with --apply")
-    code, out, err = run_cli(sw + ["--out", tmp, "--apply"])
+    code, out, err = run_cli(
+        sw + ["--out", os.path.join(tmp, "nodir", "x.csv"), "--apply"])
     check(code == 2 and "could not write" in err and "VERDICT" in out,
           "a failed write exits 2, and the verdict printed above it still "
           "shows")
     before = [open(p, "rb").read() for p in (src_csv, app_csv)]
     for target in (src_csv, app_csv, os.path.join(tmp, ".", "source.csv")):
         code, out, err = run_cli(sw + ["--out", target, "--apply"])
-        check(code == 64 and "is also an input file" in err and out == "",
+        check(code == 64 and "already exists" in err and out == "",
               "--out naming an input file is refused  <-- pinned defect")
     check(run_cli(sw + ["--out", src_csv])[0] == 64,
           "and is refused on a dry run too")
     check(before == [open(p, "rb").read() for p in (src_csv, app_csv)],
           "and neither input was touched")
+    precious = tmpfile("precious.txt", "keep me\n")
+    code, out, err = run_cli(sw + ["--out", precious, "--apply"])
+    with open(precious, encoding="utf-8") as handle:
+        kept = handle.read()
+    check(code == 64 and "already exists" in err and kept == "keep me\n",
+          "--out naming any other existing file is refused, not overwritten  "
+          "<-- pinned defect")
+    check(run_cli(sw + ["--out", tmp, "--apply"])[0] == 64,
+          "and so is an existing directory")
+    refused = False
+    try:
+        write_classified(precious, judge([("A", "2026-03-01 01:00:00")], {}))
+    except FileExistsError:
+        refused = True
+    with open(precious, encoding="utf-8") as handle:
+        kept = handle.read()
+    check(refused and kept == "keep me\n",
+          "the writer itself refuses an existing path, so a file that "
+          "appeared after the check survives  <-- pinned defect")
     code, out, err = run_cli(sw + ["--apply"])
     check(code == 64 and "--apply needs --out" in err,
           "--apply with nothing to write is a usage error")
+    for flag in ("--out", "--key-field", "--stamp-field",
+                 "--applied-key-field", "--applied-stamp-field"):
+        code, out, err = run_cli(sw + [flag, ""])
+        check(code == 64 and flag + " cannot be empty" in err and out == "",
+              "%s \"\" is refused, not read as not given  <-- pinned "
+              "defect" % flag)
     check(run_cli(sw + ["--sample", "-1"])[0] == 64,
           "a negative --sample is a usage error")
 
@@ -1092,8 +1323,10 @@ def _self_test(tmp):
     base = ["safemark", "--source", alt_src, "--applied", alt_app,
             "--old-watermark", "2026-03-01 00:00:00", "--new-watermark",
             "2026-03-01 01:00:00"]
-    check(run_cli(base)[0] == 64,
-          "default column names that the file lacks are a usage error")
+    code, out, err = run_cli(base)
+    check(code == 64 and "It has: ID, UPDATED" in err,
+          "default column names that the file lacks are a usage error, and "
+          "the message echoes the header row of the file")
     code, out, err = run_cli(base + ["--key-field", "ID", "--stamp-field",
                                      "UPDATED", "--applied-stamp-field",
                                      "SERVED"])
@@ -1133,6 +1366,123 @@ def _self_test(tmp):
     check(code == 1 and "A" + chr(0xFFFD) in out,
           "bytes that are not UTF-8 are decoded lossily and the run goes on")
 
+    huge = tmpfile("huge.csv", "KEY,STAMP\nA," + "x" * 200000 + "\n")
+    code, out, err = run_cli(
+        ["safemark", "--source", huge, "--applied", app_csv,
+         "--old-watermark", "2026-03-01", "--new-watermark", "2026-03-02"])
+    check(code == 2 and "field larger than field limit" in err
+          and "Traceback" not in err,
+          "a field over the csv limit exits 2 on every Python version")
+    empty_csv = tmpfile("zero.csv", "")
+    code, out, err = run_cli(
+        ["safemark", "--source", empty_csv, "--applied", app_csv,
+         "--old-watermark", "2026-03-01", "--new-watermark", "2026-03-02"])
+    check(code == 64 and "no columns at all" in err,
+          "a zero-byte file is a usage error, exit 64")
+    tabbed = tmpfile("tab.csv", "KEY\tSTAMP\nA\t2026-03-01 01:00:00\n")
+    code, out, err = run_cli(
+        ["safemark", "--source", tabbed, "--applied", app_csv,
+         "--old-watermark", "2026-03-01", "--new-watermark", "2026-03-02"])
+    check(code == 64 and "columns not in the CSV" in err,
+          "a tab-delimited export is a usage error, exit 64")
+
+    # ---- the CLI: files that are not what they seem
+    def sm_bytes(name, data):
+        path = os.path.join(tmp, name)
+        with open(path, "wb") as handle:
+            handle.write(data)
+        return run_cli(["safemark", "--source", path, "--applied", app_csv,
+                        "--old-watermark", "2026-03-01", "--new-watermark",
+                        "2026-03-02"])
+
+    code, out, err = sm_bytes("u16.csv", "KEY,STAMP\n".encode("utf-16"))
+    check(code == 64 and "looks like a UTF-16 file" in err,
+          "a UTF-16 export is a usage error, exit 64, on every Python "
+          "version")
+    code, out, err = sm_bytes("semi.csv", b"KEY;STAMP\nA;2026-03-01\n")
+    check(code == 64 and "columns not in the CSV" in err,
+          "a semicolon-delimited export is a usage error, exit 64")
+    code, out, err = sm_bytes(
+        "esri-dates.csv", b"KEY,STAMP\nA,3/1/2026 1:00:00 AM\n"
+        b"B,1772326800000\n")
+    check(code == 4 and "UNDATED 2" in out,
+          "stamps in an Esri or spreadsheet style, and epoch milliseconds, "
+          "are UNDATED and the run exits 4, never 0")
+    code, out, err = sm_bytes(
+        "lines.csv", b'KEY,STAMP\nA,"2026-03-01 01:00:00"\n\n'
+        b'B,\n"C\nD",\n')
+    check("row 2  key B" in out and "row 3  key C" in out,
+          "row numbers count CSV records, not file lines: a blank line and a "
+          "quoted newline do not shift them")
+    code, out, err = sm_bytes("esc.csv", b"KEY,STAMP\nA\x1b[31m,\n")
+    check("A\x1b[31m" in out,
+          "control characters in a key are printed as they are")
+
+    class ClosedPipe(io.StringIO):
+        def write(self, text):
+            raise BrokenPipeError("probe")
+
+    err_buf = io.StringIO()
+    with contextlib.redirect_stdout(ClosedPipe()), \
+            contextlib.redirect_stderr(err_buf):
+        code = main(fz)
+    check(code == 70 and "BrokenPipeError" in err_buf.getvalue(),
+          "a closed stdout ends the run with exit 70 and no verdict, never a "
+          "finding")
+
+    # ---- the CLI: verdicts that must not read as clean
+    def sm(src_text, app_text, new_mark, old_mark="2026-02-01 00:00:00"):
+        src_path = tmpfile("v-src.csv", src_text)
+        app_path = tmpfile("v-app.csv", app_text)
+        return run_cli(["safemark", "--source", src_path, "--applied",
+                        app_path, "--old-watermark", old_mark,
+                        "--new-watermark", new_mark])
+
+    code, out, err = sm("KEY,STAMP\n,2026-03-01 01:00:00\n"
+                        ",2026-03-01 02:00:00\n,2026-03-01 03:00:00\n",
+                        "KEY,STAMP\n,2026-03-01 03:00:00\n"
+                        "Z,2026-03-01 00:30:00\n", "2026-03-01 03:00:00")
+    check(code == 4 and "APPLIED 0" in out and "UNDATED 3" in out
+          and "SAFE  " not in out,
+          "blank keys in source and applied never collapse into APPLIED: "
+          "exit 4, not a false SAFE  <-- pinned defect")
+    code, out, err = sm("KEY,STAMP\n,2026-03-01 01:00:00\n",
+                        "KEY,STAMP\n,2026-03-01 03:00:00\n",
+                        "2026-03-01 03:00:00")
+    check(code == 4 and "none with a readable key and stamp" in out,
+          "an applied file whose every key is blank compares nothing")
+    code, out, err = sm("KEY,STAMP\nA,2026-03-01 01:00:00\nB,\n",
+                        "KEY,STAMP\nA,2026-03-01 01:00:00\n",
+                        "2026-03-01 01:00:00")
+    check(code == 1 and "UNDATED" in out and "SAFE  " not in out,
+          "an UNDATED row alone makes the run exit 1  <-- pinned defect")
+    code, out, err = sm("KEY,STAMP\nA,2026-03-01 01:00:00\n",
+                        "KEY,STAMP\nA,2026-03-01 01:00:00\n",
+                        "2026-03-05")
+    check(code == 1 and "AHEAD" in out and "STRANDED 0" in out
+          and "SAFE  " not in out,
+          "an AHEAD mark alone makes the run exit 1  <-- pinned defect")
+    code, out, err = sm("KEY,STAMP\nA,2026-03-01 01:00:00\n"
+                        "B,2026-03-01 02:00:00\nD,2026-03-01 04:30:00\n",
+                        "KEY,STAMP\nA,2026-03-01 01:00:00\n",
+                        "2026-03-01 04:00:00", "2026-03-01 03:00:00")
+    check(code == 0 and "OUTSIDE" in out and "1900-01-01" in out
+          and "VERDICT: no skipped row found above the old watermark."
+          in out and "no freeze" not in out,
+          "a row skipped by an earlier run is shown as a note, and the "
+          "verdict says what it judged  <-- pinned defect")
+    code, out, err = sm("KEY,STAMP\nA,2026-03-01 01:00:00\n"
+                        "B,2026-03-01 02:00:00\n",
+                        "KEY,STAMP\nA,3/1/2026 1:10:00 AM\n"
+                        "B,3/1/2026 2:05:00 AM\n", "2026-03-01 06:00:00")
+    check(code == 4 and "STRANDED" not in out and "date format" in out
+          and "nothing was compared" in out,
+          "an applied file in an unread date format exits 4, not a false "
+          "STRANDED finding  <-- pinned defect")
+    code, out, err = sm("KEY,STAMP\n", "KEY,STAMP\n", "2026-03-01")
+    check(code == 4 and "SAFE  " not in out and "nothing was compared" in out,
+          "a header-only source exits 4 and prints no SAFE line")
+
     # ---- the CLI: usage
     check(run_cli([])[0] == 64, "no mode and no --self-test is a usage error")
     code, out, err = run_cli([])
@@ -1147,6 +1497,14 @@ def _self_test(tmp):
     code, out, err = run_cli(sw + ["--base-max", "2026-01-01"])
     check(code == 64 and "--base-max cannot be used with safemark" in err,
           "a frozenmark flag given to safemark is refused")
+    code, out, err = run_cli(sw + ["--max-age-hours", "0"])
+    check(code == 64 and "--max-age-hours cannot be used with safemark"
+          in err,
+          "and a zero value counts as given: 0 is not False  "
+          "<-- pinned defect")
+    code, out, err = run_cli(fz + ["--sample", "0"])
+    check(code == 64 and "--sample cannot be used with frozenmark" in err,
+          "--sample 0 given to frozenmark is refused too  <-- pinned defect")
     code, out, err = run_cli(["safemark", "--source", src_csv])
     check(code == 64 and "--applied, --old-watermark, --new-watermark" in err,
           "every missing safemark flag is listed at once")
@@ -1277,11 +1635,12 @@ def _self_test(tmp):
           "the one parser sets allow_abbrev=False")
     writers = [n for n in ast.walk(tree) if isinstance(n, ast.Call)
                and getattr(n.func, "id", "") == "open"
-               and any(isinstance(a, ast.Constant) and a.value == "w"
+               and any(isinstance(a, ast.Constant) and a.value in ("w", "x")
                        for a in n.args[1:2])]
-    check(len(writers) == 2,
+    check(len(writers) == 2
+          and sorted(w.args[1].value for w in writers) == ["w", "x"],
           "the module opens a file for writing in exactly two places: the "
-          "report writer and this self-test")
+          "report writer (exclusive) and this self-test")
 
     # ---- the harness itself. A check() that cannot record a failure would
     # report every defect above as a pass, which is the one failure no other
