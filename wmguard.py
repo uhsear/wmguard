@@ -516,9 +516,11 @@ def read_csv(path, fields):
     absent = [f for f in fields if f not in header]
     if absent:
         raise ValueError(
-            "%s: columns not in the CSV: %s. It has: %s"
+            "%s: columns not in the CSV: %s. It has %s. The names are not "
+            "printed, because a file given by mistake can hold a secret in "
+            "its first line. A file read as one column is not comma-separated."
             % (path, ", ".join(absent),
-               ", ".join(header) if header else "(no columns at all)"))
+               "%d column(s)" % len(header) if header else "no columns at all"))
     return list(reader)
 
 
@@ -619,7 +621,11 @@ def _discard_stdout():
     """Point stdout at the null device so the flush at exit cannot fail.
     This is the recipe in the Python signal module docs for a closed pipe."""
     try:
-        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        null_fd = os.open(os.devnull, os.O_WRONLY)
+        try:
+            os.dup2(null_fd, sys.stdout.fileno())
+        finally:
+            os.close(null_fd)
     except (OSError, ValueError, AttributeError):
         # A stdout with no file descriptor (or none at all) has no exit flush
         # to fail.
@@ -699,8 +705,8 @@ def _run_safe(args):
     sample = DEFAULT_SAMPLE if args.sample is None else args.sample
     if sample < 0:
         raise ValueError("--sample cannot be negative.")
-    for name in ("key_field", "stamp_field", "applied_key_field",
-                 "applied_stamp_field", "out"):
+    for name in ("source", "applied", "key_field", "stamp_field",
+                 "applied_key_field", "applied_stamp_field", "out"):
         if getattr(args, name) == "":
             raise ValueError("%s cannot be empty." % _flag(name))
     if args.apply and not args.out:
@@ -1198,13 +1204,15 @@ def _self_test(tmp):
     try:
         read_csv(bom, ("NOPE",))
     except ValueError as exc:
-        check("NOPE" in str(exc) and "KEY, STAMP" in str(exc),
-              "and lists the columns the file does have")
+        check("NOPE" in str(exc) and "It has 2 column(s)" in str(exc)
+              and "STAMP" not in str(exc),
+              "and counts the columns the file has without printing their "
+              "names  <-- pinned defect")
     empty = tmpfile("empty.csv", "")
     try:
         read_csv(empty, ("KEY",))
     except ValueError as exc:
-        check("(no columns at all)" in str(exc),
+        check("no columns at all" in str(exc),
               "an empty file says it has no columns at all")
 
     # ---- the CLI: frozenmark
@@ -1423,14 +1431,18 @@ def _self_test(tmp):
     check(code == 2 and "could not write" in err and "VERDICT" in out,
           "a failed write exits 2, and the verdict printed above it still "
           "shows")
-    before = [open(p, "rb").read() for p in (src_csv, app_csv)]
+    def raw(path):
+        with open(path, "rb") as handle:
+            return handle.read()
+
+    before = [raw(p) for p in (src_csv, app_csv)]
     for target in (src_csv, app_csv, os.path.join(tmp, ".", "source.csv")):
         code, out, err = run_cli(sw + ["--out", target, "--apply"])
         check(code == 64 and "already exists" in err and out == "",
               "--out naming an input file is refused  <-- pinned defect")
     check(run_cli(sw + ["--out", src_csv])[0] == 64,
           "and is refused on a dry run too")
-    check(before == [open(p, "rb").read() for p in (src_csv, app_csv)],
+    check(before == [raw(p) for p in (src_csv, app_csv)],
           "and neither input was touched")
     precious = tmpfile("precious.txt", "keep me\n")
     code, out, err = run_cli(sw + ["--out", precious, "--apply"])
@@ -1441,6 +1453,13 @@ def _self_test(tmp):
           "<-- pinned defect")
     check(run_cli(sw + ["--out", tmp, "--apply"])[0] == 64,
           "and so is an existing directory")
+    linked = os.path.join(tmp, "source-link.csv")
+    os.link(src_csv, linked)
+    code, out, err = run_cli(sw + ["--out", linked, "--apply"])
+    check(code == 64 and "already exists" in err
+          and before[0] == raw(src_csv),
+          "and so is a hard link to an input file, which leaves the input "
+          "as it was")
     refused = False
     try:
         write_classified(precious, judge([("A", "2026-03-01 01:00:00")], {}))
@@ -1454,8 +1473,9 @@ def _self_test(tmp):
     code, out, err = run_cli(sw + ["--apply"])
     check(code == 64 and "--apply needs --out" in err,
           "--apply with nothing to write is a usage error")
-    for flag in ("--out", "--key-field", "--stamp-field",
-                 "--applied-key-field", "--applied-stamp-field"):
+    for flag in ("--source", "--applied", "--out", "--key-field",
+                 "--stamp-field", "--applied-key-field",
+                 "--applied-stamp-field"):
         code, out, err = run_cli(sw + [flag, ""])
         check(code == 64 and flag + " cannot be empty" in err and out == "",
               "%s \"\" is refused, not read as not given  <-- pinned "
@@ -1470,9 +1490,18 @@ def _self_test(tmp):
             "--old-watermark", "2026-03-01 00:00:00", "--new-watermark",
             "2026-03-01 01:00:00"]
     code, out, err = run_cli(base)
-    check(code == 64 and "It has: ID, UPDATED" in err,
+    check(code == 64 and "It has 2 column(s)" in err
+          and "UPDATED" not in err,
           "default column names that the file lacks are a usage error, and "
-          "the message echoes the header row of the file")
+          "the message does not echo the header row of the file")
+    secret = tmpfile("secret.csv", "API_TOKEN=abc123xyz\n")
+    code, out, err = run_cli(["safemark", "--source", secret, "--applied",
+                              alt_app, "--old-watermark", "2026-03-01",
+                              "--new-watermark", "2026-03-02"])
+    check(code == 64 and "abc123xyz" not in err and "API_TOKEN" not in err
+          and "It has 1 column(s)" in err and out == "",
+          "a credential file given by mistake never reaches stderr or "
+          "stdout  <-- pinned defect")
     code, out, err = run_cli(base + ["--key-field", "ID", "--stamp-field",
                                      "UPDATED", "--applied-stamp-field",
                                      "SERVED"])
@@ -1760,6 +1789,12 @@ def _self_test(tmp):
     check(handed == 7,
           "main returns the exit status of --self-test, so a red self-test "
           "fails CI  <-- pinned defect")
+    for bad in (["--bogus"], ["--sample", "x"]):
+        code, out, err = run_cli(["--self-test"] + bad)
+        check(code == 64 and out == "",
+              "--self-test with the refused flag %s exits 64 before any "
+              "assertion runs, so the other flags are ignored only when "
+              "they are valid  <-- pinned defect" % bad[0])
 
     # ---- a character the console cannot encode
     calls = []

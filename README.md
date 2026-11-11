@@ -50,6 +50,8 @@ PASS  an applied file with rows and none readable compares nothing, instead of r
 ...
 PASS  without --apply nothing is written  <-- pinned defect
 ...
+PASS  a credential file given by mistake never reaches stderr or stdout  <-- pinned defect
+...
 PASS  every key that starts with = + - @ comes out with a guard apostrophe in --out, and a plain key does not  <-- pinned defect
 ...
 PASS  the --out file read back as the applied file gives every key back, so the round trip is lossless  <-- pinned defect
@@ -67,10 +69,10 @@ PASS  --ap, a prefix of a write flag, is refused and writes nothing  <-- pinned 
 PASS  the module imports no network library, so it has no connection to leak a credential from  <-- pinned defect
 ...
 --------------------------------------------------------------------
-209 assertions, 0 failed
+215 assertions, 0 failed
 ```
 
-The full run prints all 209 assertions. Each `...` line above is where this block is cut.
+The full run prints all 215 assertions. Each `...` line above is where this block is cut.
 
 ## What already exists
 
@@ -110,10 +112,10 @@ day.
 
 Python 3.9 or newer and nothing else. No `arcpy`, no third-party package, no network, no database.
 
-The self-test prints the same 209 assertions on Windows (Python 3.13.2, 3.12.10 and 3.10.20),
-on Python 3.9.25 and on Ubuntu (Python 3.12.3). The outputs are identical line for line, once the
+The self-test prints the same 215 assertions on Windows (Python 3.13.2 and 3.12.10)
+and on Ubuntu (Python 3.9.25 and 3.12.3). The outputs are identical line for line, once the
 carriage returns that Windows adds are removed. `coverage run --branch wmguard.py --self-test`
-reports 100 percent of lines and branches (923 statements, 154 branches).
+reports 100 percent of lines and branches (939 statements, 156 branches).
 
 ```
 git clone https://github.com/uhsear/wmguard.git
@@ -168,12 +170,12 @@ the version the session set, and it does not move on (see Sources).
 | `--sample` | safemark | How many rows to list under each heading. Default `10`. `0` lists none. |
 | `--out` | safemark | Write the class of every source row to this new CSV. Needs `--apply`. |
 | `--apply` | safemark | Actually write `--out`. Without it nothing is written. |
-| `--self-test` | none | Run the assertions and exit. Other flags are ignored. |
+| `--self-test` | none | Run the assertions and exit. Other valid flags are ignored. A flag the parser refuses still exits 64 and runs no assertion. |
 
 A flag that belongs to the other mode is refused with exit 64, so a run never looks defended by a
 flag it did not read. A zero value counts as given: `frozenmark --sample 0` and
-`safemark --max-age-hours 0` are refused. A flag given an empty value, such as `--out ""` or
-`--key-field ""`, is refused with exit 64 too, and is never read as "not given".
+`safemark --max-age-hours 0` are refused. A flag given an empty value, such as `--source ""`,
+`--out ""` or `--key-field ""`, is refused with exit 64 too, and is never read as "not given".
 
 Every flag must be spelled in full. The parser sets `allow_abbrev=False`, so `--ap` is refused with
 exit 64 and is not read as `--apply`. The self-test also pins `--app`, `--appl`, `--ou`, `--sour`,
@@ -461,7 +463,7 @@ stamp blank, would otherwise report a clean run. A scheduled job reads 0 as "saf
 - **Keys are compared as trimmed text.** `P-1` and `p-1` are two keys, and so are `7` and `07`.
 - **Only comma-separated UTF-8 CSV is read.** UTF-16, tab-delimited and semicolon-delimited files
   exit 64. A UTF-16 file gets its own message. A tab or semicolon file gets "columns not in the
-  CSV", with a header line that shows the problem. A file with a byte that is not UTF-8,
+  CSV" and a count of one column, which shows the problem. A file with a byte that is not UTF-8,
   such as a Windows-1252 export with accented names, exits 2 and names the file, the byte and its
   offset. Nothing is decoded lossily, so two keys never collapse into one. A BOM at the start of a UTF-8 file is removed. A NUL
   byte inside a file gives exit 2 on Python 3.9 and 3.10, where the csv module refuses it, and is
@@ -470,8 +472,10 @@ stamp blank, would otherwise report a clean run. A scheduled job reads 0 as "saf
 - **An empty file is a usage error.** A zero-byte `--source` or `--applied` exits 64 with "columns
   not in the CSV", and not 2.
 - **A header-only source** has no rows to compare. It exits 4 and prints no `SAFE` line.
-- **A wrong column name echoes the header.** The message lists the columns of the file, so do not
-  point `--source` at a file whose first line is sensitive.
+- **A wrong column name never echoes the header.** The message names the columns you asked for and
+  counts the columns the file has, so a file given by mistake, such as one that holds a token in
+  its first line, does not reach the log. A count of 1 usually means the file is not
+  comma-separated. The self-test pins that a credential-shaped first line is not printed.
 - **Control characters in a key are printed as they are.** A key that holds an escape sequence or a
   newline can change what the console shows.
 - **Row numbers count CSV records.** A blank line or a quoted newline moves them away from the line
@@ -522,7 +526,8 @@ stamp blank, would otherwise report a clean run. A scheduled job reads 0 as "saf
   and not with a code from the table above. That is a stop by the operator and not a finding.
 - **Both files are read into memory.** One run of 300,000 source rows and 297,000 applied rows took
   about 11 seconds (10.5 to 11.6 over four runs) on a Windows workstation with Python 3.13.2. The
-  keys were `K0` to `K299999`, the stamps were 20 seconds apart, and 2,549 rows were stranded. Under
+  keys were `K0` to `K299999`, the stamps were 20 seconds apart, and 2,549 rows were stranded. The
+  generator of that file is not published, so the stranded count cannot be repeated. Under
   `cProfile`, 24 of 28 seconds went to `strptime`. That is one machine, so yours will differ. A
   table of tens of millions of rows is not what this is for.
 - **The self-test reads the clock.** The assertions that omit `--now` expect `2026-01-05` to be
@@ -530,8 +535,27 @@ stamp blank, would otherwise report a clean run. A scheduled job reads 0 as "saf
 - **There is no `--fix`.** The tool names a safe mark. Writing it to the watermark table is an
   edit somebody signs for.
 - **No line is unreachable.** Coverage is 100 percent of lines and branches. The self-test starts
-  one child interpreter, to prove that a key the console cannot encode still prints a verdict.
-  Coverage does not trace that child, and the in-process assertions cover the same lines.
+  two child interpreters. One proves that a key the console cannot encode still prints a verdict.
+  The other proves that a closed stdout pipe exits 70. Coverage does not trace the children, and
+  the in-process assertions cover the same lines.
+- **A UTF-16 file without a byte-order mark** exits 2 on Python 3.9 and 3.10, where the csv module
+  refuses its NUL bytes, and exits 64 on 3.11 and later. A UTF-16 file with a mark exits 64 on
+  every version.
+- **A mark taken from the `_evw` view needs `--view-max`.** Without it, `frozenmark` compares the
+  mark with the base MAX only, and a mark that is ahead of the base table reads as `AHEAD`
+  (exit 1). Give `--view-max` for a job that reads the view.
+- **Keys that begin with a minus sign,** including negative integers such as `-3`, are written to
+  `--out` with a guard apostrophe. The reader removes it, so the round trip is lossless, but a
+  spreadsheet shows the apostrophe.
+- **`--out` is written with CRLF line endings,** the default of Python's csv module, on every
+  platform.
+- **A red self-test exits 1,** the same code as a finding. Read the `0 failed` footer, not only the
+  exit code, to tell them apart.
+- **A `--out` path that names a Windows device,** such as `aux.csv`, was not probed.
+- **The seven-digit precision of `datetime2(7)`** is stated from SQL Server documentation that this
+  README does not cite.
+- **The compress-to-delta-table behaviour in the opening** is an inference from the Esri pages in
+  Sources, not a quoted statement.
 - It opens no socket and imports no network module, so no credential can leak from it. The
   self-test reads its own source to assert that.
 
