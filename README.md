@@ -50,6 +50,10 @@ PASS  an applied file with rows and none readable compares nothing, instead of r
 ...
 PASS  without --apply nothing is written  <-- pinned defect
 ...
+PASS  every key that starts with = + - @ comes out with a guard apostrophe in --out, and a plain key does not  <-- pinned defect
+...
+PASS  the --out file read back as the applied file gives every key back, so the round trip is lossless  <-- pinned defect
+...
 PASS  --out naming any other existing file is refused, not overwritten  <-- pinned defect
 ...
 PASS  and a zero value counts as given: 0 is not False  <-- pinned defect
@@ -59,10 +63,10 @@ PASS  --ap, a prefix of a write flag, is refused and writes nothing  <-- pinned 
 PASS  the module imports no network library, so it has no connection to leak a credential from  <-- pinned defect
 ...
 --------------------------------------------------------------------
-186 assertions, 0 failed
+200 assertions, 0 failed
 ```
 
-The full run prints all 186 assertions. Each `...` line above is where this block is cut.
+The full run prints all 200 assertions. Each `...` line above is where this block is cut.
 
 ## What already exists
 
@@ -102,10 +106,10 @@ day.
 
 Python 3.9 or newer and nothing else. No `arcpy`, no third-party package, no network, no database.
 
-The self-test prints the same 186 assertions on Windows (Python 3.13.2, 3.12.10 and 3.10.20),
+The self-test prints the same 200 assertions on Windows (Python 3.13.2, 3.12.10 and 3.10.20),
 on Python 3.9.25 and on Ubuntu (Python 3.12.3). The outputs are identical line for line, once the
 carriage returns that Windows adds are removed. `coverage run --branch wmguard.py --self-test`
-reports 100 percent of lines and branches (829 statements, 140 branches).
+reports 100 percent of lines and branches (860 statements, 146 branches).
 
 ```
 git clone https://github.com/uhsear/wmguard.git
@@ -375,6 +379,15 @@ A blank key never matches. A source row above the old mark with a blank key is `
 row with a blank key is counted as unreadable and left out. Without that rule, one blank-key applied
 row would mark every blank-key source row as applied, and the run would exit 0.
 
+A spreadsheet runs a cell that starts with `=`, `+`, `-`, `@`, a tab or a carriage return as a
+formula. OWASP lists those six characters and recommends to "Prepend each cell field with a single
+quote" ([CSV Injection](https://community.owasp.org/attacks/CSV_Injection)). The `key` column of
+`--out` comes from the source file, so `wmguard` puts one apostrophe in front of such a key.
+`=HYPERLINK("http://x.invalid","y")` is written as `'=HYPERLINK(...)`. Row numbers stay numbers.
+The reader removes the apostrophe again, so `--out` can be the `--applied` file of a later run
+(`--applied-key-field key --applied-stamp-field stamp`). The self-test runs that round trip with
+nine keys, and writes the file with the real `--apply` path.
+
 If the applied file has rows and none has a readable key and stamp, the tool compares nothing and
 exits 4. A date format it does not read, such as `3/1/2026 1:10:00 AM`, would otherwise make every
 source row look unapplied, and a scheduled job could not tell that from a real finding.
@@ -450,8 +463,15 @@ stamp blank, would otherwise report a clean run. A scheduled job reads 0 as "saf
   newline can change what the console shows.
 - **Row numbers count CSV records.** A blank line or a quoted newline moves them away from the line
   numbers of an editor.
-- **A key that starts with `=`, `+`, `-` or `@`** is written to `--out` as it came. Open the file as
-  text, or quote it first. A spreadsheet may read it as a formula.
+- **A guarded key is read back as the key.** `--out` writes a key that starts with `=`, `+`, `-`,
+  `@`, a tab or a CR with one apostrophe in front, and the reader removes exactly one such
+  apostrophe from the key column of `--source` and `--applied`. A source key that is already
+  written as an apostrophe followed by one of those characters, such as `'=x`, is therefore read
+  as `=x` and written as `'=x`. That is the one key the file does not copy byte for byte. Keys are
+  trimmed before they are written, so a tab or CR at the start of a key never reaches the guard
+  through the CLI. The guard still covers both, and the self-test calls it with both. The other
+  three columns are not guarded: the row number is an integer, the stamp comes from a parsed
+  timestamp, and the class is one of five fixed words. Stdout is not a CSV and is not guarded.
 - **`--out` is written in place,** not through a temporary file. A failed write can leave a partial
   file, and the exit code is 2. The verdict is printed above the error.
 - **Do not close the pipe early.** A closed stdout, as in `| head`, ends the run with exit 70 and
@@ -497,6 +517,9 @@ stamp blank, would otherwise report a clean run. A scheduled job reads 0 as "saf
   not qualify is my reading of the page.
 - Microsoft, [datetime (Transact-SQL)](https://learn.microsoft.com/en-us/sql/t-sql/data-types/datetime-transact-sql):
   accuracy "Rounded to increments of .000, .003, or .007 seconds", and time zone offset aware: "No".
+- OWASP, [CSV Injection](https://community.owasp.org/attacks/CSV_Injection): the six characters
+  that start a dangerous cell, and the recommendation to prepend a single quote. The tool does not
+  open a spreadsheet, so the effect of the apostrophe in Excel was not run here.
 - dlt, [lag](https://dlthub.com/docs/general-usage/incremental/lag) and
   [cursor](https://dlthub.com/docs/general-usage/incremental/cursor): the `lag` and
   `on_cursor_value_missing` settings described above.

@@ -191,6 +191,33 @@ def judge_frozen(watermark, base_max, view_max, now, max_age):
     return out
 
 
+FORMULA_LEAD = ("=", "+", "-", "@", "\t", "\r")
+GUARD_MARK = "'"
+
+
+def _guarded(value):
+    """True when value is a formula lead after any run of guard marks."""
+    return value.lstrip(GUARD_MARK)[:1] in FORMULA_LEAD
+
+
+def cell(value):
+    """A text cell for the CSV that a spreadsheet will not run as a formula.
+
+    A cell that starts with = + - @ tab or CR gets one apostrophe in front.
+    A value that already starts with an apostrophe before such a character
+    gets one more, so uncell() gives back exactly what went in."""
+    if _guarded(value):
+        return GUARD_MARK + value
+    return value
+
+
+def uncell(value):
+    """The inverse of cell(): removes exactly one guard apostrophe."""
+    if value.startswith(GUARD_MARK) and _guarded(value):
+        return value[1:]
+    return value
+
+
 def build_applied(records, key_field, stamp_field):
     """(newest applied stamp by key, count of rows with no readable stamp).
 
@@ -201,7 +228,7 @@ def build_applied(records, key_field, stamp_field):
     applied = {}
     unreadable = 0
     for rec in records:
-        key = (rec.get(key_field) or "").strip()
+        key = uncell((rec.get(key_field) or "").strip())
         try:
             stamp = parse_stamp(rec.get(stamp_field))
         except ValueError:
@@ -220,7 +247,7 @@ def build_source(records, key_field, stamp_field):
     """SourceRow list. A stamp that is blank or unreadable becomes None."""
     rows = []
     for number, rec in enumerate(records, 1):
-        key = (rec.get(key_field) or "").strip()
+        key = uncell((rec.get(key_field) or "").strip())
         try:
             stamp = parse_stamp(rec.get(stamp_field))
         except ValueError:
@@ -436,7 +463,7 @@ def describe_safe(report, sample):
 
 
 def classified_rows(report):
-    return [{"row": r.number, "key": r.key,
+    return [{"row": r.number, "key": cell(r.key),
              "stamp": "" if r.stamp is None else fmt_stamp(r.stamp),
              "class": v}
             for r, v in zip(report.rows, report.verdicts)]
@@ -1265,6 +1292,72 @@ def _self_test(tmp):
           and "2,B,2026-03-01 02:00:00,STRANDED" in written
           and len(written.splitlines()) == 6,
           "with --apply the classification is written, one line per row")
+
+    # ---- the CSV is safe to open in a spreadsheet
+    for lead, name in (("=", "equals"), ("+", "plus"), ("-", "minus"),
+                       ("@", "at sign"), ("\t", "tab"), ("\r", "CR")):
+        check(cell(lead + "x") == "'" + lead + "x"
+              and uncell(cell(lead + "x")) == lead + "x",
+              "a cell that starts with %s gets one apostrophe, and uncell "
+              "gives it back  <-- pinned defect" % name)
+    check([cell(v) for v in ("P-1", "a=b", "", "'x", "'", "7", "x+y")]
+          == ["P-1", "a=b", "", "'x", "'", "7", "x+y"],
+          "a cell that does not start with a formula character is "
+          "unchanged")
+    check(all(uncell(cell(v)) == v for v in (
+        "=x", "'=x", "''=x", "'-1", "'", "''", "'a", "@", "\t", "\r\n=",
+        "", "x", "+")),
+          "uncell(cell(v)) is v for values that already start with the "
+          "guard apostrophe  <-- pinned defect")
+    check(uncell("'x") == "'x" and uncell("'=x") == "=x"
+          and uncell("''=x") == "'=x",
+          "uncell removes exactly one apostrophe and only a guard one")
+    formula_src = tmpfile(
+        "formula-source.csv",
+        'KEY,STAMP\n'
+        '"=HYPERLINK(""http://x.invalid"",""y"")",2026-03-01 01:00:00\n'
+        '+1+1,2026-03-01 01:10:00\n'
+        '-2+3,2026-03-01 01:20:00\n'
+        '@SUM(1),2026-03-01 01:30:00\n'
+        '"\t=tabbed",2026-03-01 01:40:00\n'
+        '"\r=returned",2026-03-01 01:50:00\n'
+        "'=literal,2026-03-01 02:00:00\n"
+        'P-1,2026-03-01 02:10:00\n'
+        'a=b,2026-03-01 02:20:00\n')
+    formula_app = tmpfile("formula-applied.csv",
+                          "KEY,STAMP\nP-1,2026-03-01 02:10:00\n")
+    formula_out = os.path.join(tmp, "formula-rows.csv")
+    formula_sw = ["safemark", "--source", formula_src, "--applied",
+                  formula_app, "--old-watermark", "2026-03-01 00:00:00",
+                  "--new-watermark", "2026-03-01 02:20:00"]
+    code, out, err = run_cli(formula_sw + ["--out", formula_out, "--apply"])
+    with open(formula_out, newline="", encoding="utf-8") as handle:
+        formula_rows = list(csv.reader(handle))
+    keys = [r[1] for r in formula_rows[1:]]
+    check(code == 1 and keys == [
+        "'=HYPERLINK(\"http://x.invalid\",\"y\")", "'+1+1", "'-2+3",
+        "'@SUM(1)", "'=tabbed", "'=returned", "'=literal", "P-1", "a=b"],
+          "every key that starts with = + - @ comes out with a guard "
+          "apostrophe in --out, and a plain key does not  <-- pinned "
+          "defect")
+    check(keys[6] == cell("=literal"),
+          "a source key that already reads as guarded is read as the "
+          "guard was removed, so --out is not a byte copy of such a key "
+          "(a limit the README names)")
+    check(all(r[0].isdigit() and r[2][:1].isdigit() and r[3] in CLASSES
+              for r in formula_rows[1:]),
+          "the row number, the stamp and the class are never guarded: the "
+          "number stays a number  <-- pinned defect")
+    check(not any(r[1][:1] in FORMULA_LEAD for r in formula_rows[1:]),
+          "no key cell in --out starts with a formula character")
+    code, out, err = run_cli(
+        formula_sw[:4] + [formula_out, "--applied-key-field", "key",
+                          "--applied-stamp-field", "stamp"]
+        + formula_sw[5:])
+    check(code == 0 and "APPLIED 9" in out and "STRANDED 0" in out,
+          "the --out file read back as the applied file gives every key "
+          "back, so the round trip is lossless  <-- pinned defect")
+
     nul_dest = os.path.join(tmp, "refused.csv")
     code, out, err = run_cli(
         ["safemark", "--source", nul_src, "--applied", ok_app,
