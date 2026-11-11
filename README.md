@@ -58,15 +58,19 @@ PASS  --out naming any other existing file is refused, not overwritten  <-- pinn
 ...
 PASS  and a zero value counts as given: 0 is not False  <-- pinned defect
 ...
+PASS  a Windows-1252 export whose two keys would both decode to U+FFFD is refused and never reads SAFE  <-- pinned defect
+...
+PASS  a pipe that dies at the flush after a short report exits 70 and points stdout at the null device, so the exit flush cannot turn it into 120  <-- pinned defect
+...
 PASS  --ap, a prefix of a write flag, is refused and writes nothing  <-- pinned defect
 ...
 PASS  the module imports no network library, so it has no connection to leak a credential from  <-- pinned defect
 ...
 --------------------------------------------------------------------
-203 assertions, 0 failed
+209 assertions, 0 failed
 ```
 
-The full run prints all 203 assertions. Each `...` line above is where this block is cut.
+The full run prints all 209 assertions. Each `...` line above is where this block is cut.
 
 ## What already exists
 
@@ -89,7 +93,7 @@ run dbt, use it for the age limit. It checks one table against the clock. It doe
 table with its current-state view, a stored mark, or the rows that were applied.
 
 This tool is for the sync that someone wrote by hand, with a watermark table and a stored
-procedure. No library guards that mark. The tool compares the stored mark with two things the
+procedure. I found no library that guards that mark. The tool compares the stored mark with two things the
 libraries above never see: the current-state view of the same table, and the rows that were
 actually applied.
 
@@ -106,10 +110,10 @@ day.
 
 Python 3.9 or newer and nothing else. No `arcpy`, no third-party package, no network, no database.
 
-The self-test prints the same 203 assertions on Windows (Python 3.13.2, 3.12.10 and 3.10.20),
+The self-test prints the same 209 assertions on Windows (Python 3.13.2, 3.12.10 and 3.10.20),
 on Python 3.9.25 and on Ubuntu (Python 3.12.3). The outputs are identical line for line, once the
 carriage returns that Windows adds are removed. `coverage run --branch wmguard.py --self-test`
-reports 100 percent of lines and branches (872 statements, 150 branches).
+reports 100 percent of lines and branches (923 statements, 154 branches).
 
 ```
 git clone https://github.com/uhsear/wmguard.git
@@ -406,7 +410,7 @@ source row look unapplied, and a scheduled job could not tell that from a real f
 |---|---|
 | 0 | Nothing found. Notes may still print. |
 | 1 | At least one finding. |
-| 2 | A file could not be read, or `--out` could not be written. |
+| 2 | A file could not be read or is not UTF-8 text, or `--out` could not be written. |
 | 4 | Nothing was compared: no source row could be judged, or no applied row was readable. |
 | 64 | Usage error: a bad flag, a bad stamp, a wrong-mode flag, an empty flag value, an existing `--out`, or a column the file lacks. |
 | 70 | An unexpected crash in the tool. It is never a finding about the data. |
@@ -443,8 +447,8 @@ stamp blank, would otherwise report a clean run. A scheduled job reads 0 as "saf
   `--applied` export looks stranded or pending. Export both right after the sync, in one
   transaction if you can.
 - **The applied file must carry the source stamp.** If the serving table stores its own load time,
-  every row looks unapplied, and the tool reports a long list of `STRANDED` rows. Copy the source
-  stamp into the serving row when you apply it.
+  a load time later than the source stamp reads as `APPLIED`, and one earlier than the source stamp
+  reads as `STRANDED`. Copy the source stamp into the serving row when you apply it.
 - **A view MAX can be stale too.** A session that set a version keeps reading that version's state
   (see Sources). Take the view MAX from a session that set none.
 - **`STALE` cannot tell frozen from idle.** Without `--view-max`, a quiet table over a long
@@ -457,8 +461,9 @@ stamp blank, would otherwise report a clean run. A scheduled job reads 0 as "saf
 - **Keys are compared as trimmed text.** `P-1` and `p-1` are two keys, and so are `7` and `07`.
 - **Only comma-separated UTF-8 CSV is read.** UTF-16, tab-delimited and semicolon-delimited files
   exit 64. A UTF-16 file gets its own message. A tab or semicolon file gets "columns not in the
-  CSV", with a header line that shows the problem. Other bytes are decoded lossily without a
-  warning, and two keys can collapse into one. A BOM at the start of a UTF-8 file is removed. A NUL
+  CSV", with a header line that shows the problem. A file with a byte that is not UTF-8,
+  such as a Windows-1252 export with accented names, exits 2 and names the file, the byte and its
+  offset. Nothing is decoded lossily, so two keys never collapse into one. A BOM at the start of a UTF-8 file is removed. A NUL
   byte inside a file gives exit 2 on Python 3.9 and 3.10, where the csv module refuses it, and is
   read as part of the text on Python 3.11 and later. A field over csv's default limit of 131072
   characters gives exit 2 on every version.
@@ -477,7 +482,8 @@ stamp blank, would otherwise report a clean run. A scheduled job reads 0 as "saf
   written as an apostrophe followed by one of those characters, such as `'=x`, is therefore read
   as `=x` and written as `'=x`. That is the one key the file does not copy byte for byte. Keys are
   trimmed before they are written, so a tab or CR at the start of a key never reaches the guard
-  through the CLI. The guard still covers both, and the self-test calls it with both. Two source
+  through the CLI. The guard still covers both, and the self-test calls it with both. The guard covers
+  these six characters only, and only after the key is trimmed. Two source
   keys that differ only by that apostrophe, such as `=x` and `'=x`, are read as one key and share
   one verdict. The other
   three columns are not guarded: the row number is an integer, the stamp comes from a parsed
@@ -503,9 +509,17 @@ stamp blank, would otherwise report a clean run. A scheduled job reads 0 as "saf
   line.
 - **The GitHub search above cannot be repeated from this repository.** It is a dated claim.
 - **`--out` is written in place,** not through a temporary file. A failed write can leave a partial
-  file, and the exit code is 2. The verdict is printed above the error.
+  file, and the exit code is 2. The verdict is printed above the error. Delete the partial file
+  before you run again, because `--out` refuses a path that exists.
 - **Do not close the pipe early.** A closed stdout, as in `| head`, ends the run with exit 70 and
-  no verdict. The exit status of the pipeline is not the tool's.
+  the verdict may not be delivered. The tool points stdout at the null device after the failure, so
+  Python cannot fail again at exit and replace the 70 with its own 120. When the reader took the
+  whole short report before it closed, the run keeps its normal code. The exit status of a
+  pipeline is the status of its last command, unless `pipefail` is set.
+- **A job that runs with stdout closed** still returns the right exit code, but nothing is printed.
+  Read the exit code and not the log.
+- **Ctrl+C is not handled.** An interrupt ends the run with Python's own status and a traceback,
+  and not with a code from the table above. That is a stop by the operator and not a finding.
 - **Both files are read into memory.** One run of 300,000 source rows and 297,000 applied rows took
   about 11 seconds (10.5 to 11.6 over four runs) on a Windows workstation with Python 3.13.2. The
   keys were `K0` to `K299999`, the stamps were 20 seconds apart, and 2,549 rows were stranded. Under

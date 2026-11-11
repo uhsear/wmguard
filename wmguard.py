@@ -486,27 +486,40 @@ def write_classified(path, report):
 
 # ------------------------------------------------------------------------- I/O
 
+class UnreadableText(Exception):
+    """The file is not UTF-8 text. Exit 2, like any file that cannot be read."""
+
+
 def read_csv(path, fields):
     """Rows of a CSV as dicts. Raises ValueError when a column is missing."""
+    with open(path, "rb") as fh:
+        data = fh.read()
     # A UTF-16 file has NUL bytes, which the csv module refuses on Python 3.9
     # and 3.10 and reads as text on 3.11 and later. Say so before that matters.
-    with open(path, "rb") as fh:
-        if fh.read(2) in (b"\xff\xfe", b"\xfe\xff"):
-            raise ValueError("%s: this looks like a UTF-16 file. Export "
-                             "comma-separated UTF-8 text." % path)
-    # utf-8-sig removes a BOM when the file starts with one. Read as plain
-    # UTF-8 the BOM would stay in the first header and break its match.
-    with open(path, newline="", encoding="utf-8-sig", errors="replace") as fh:
-        reader = csv.DictReader(fh)
-        header = [h.strip() for h in (reader.fieldnames or [])]
-        reader.fieldnames = header
-        absent = [f for f in fields if f not in header]
-        if absent:
-            raise ValueError(
-                "%s: columns not in the CSV: %s. It has: %s"
-                % (path, ", ".join(absent),
-                   ", ".join(header) if header else "(no columns at all)"))
-        return list(reader)
+    if data[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        raise ValueError("%s: this looks like a UTF-16 file. Export "
+                         "comma-separated UTF-8 text." % path)
+    # Strict UTF-8: a byte that is not UTF-8 would otherwise become U+FFFD,
+    # and two different keys could collapse into one and hide a stranded row.
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise UnreadableText(
+            "%s: byte 0x%02x at offset %d is not UTF-8. Export the file as "
+            "UTF-8 text." % (path, data[exc.start], exc.start))
+    # A BOM would stay in the first header and break its match.
+    if text.startswith("\ufeff"):
+        text = text[1:]
+    reader = csv.DictReader(io.StringIO(text, newline=""))
+    header = [h.strip() for h in (reader.fieldnames or [])]
+    reader.fieldnames = header
+    absent = [f for f in fields if f not in header]
+    if absent:
+        raise ValueError(
+            "%s: columns not in the CSV: %s. It has: %s"
+            % (path, ", ".join(absent),
+               ", ".join(header) if header else "(no columns at all)"))
+    return list(reader)
 
 
 # ------------------------------------------------------------------------- CLI
@@ -572,9 +585,8 @@ def _flag(name):
 def _tolerate_odd_characters():
     """Make print() unable to fail on a character the console cannot encode.
 
-    A key read from a file that is not UTF-8 arrives as U+FFFD, which a cp1252
-    pipe cannot write. The UnicodeEncodeError would exit 1 and the verdict
-    would never print. A character that cannot be shown prints as ? instead.
+    A key that holds a character a cp1252 pipe cannot write would raise a
+    UnicodeEncodeError, exit 1 and never print the verdict. A character that cannot be shown prints as ? instead.
     """
     for stream in (sys.stdout, sys.stderr):
         reconfigure = getattr(stream, "reconfigure", None)
@@ -587,13 +599,31 @@ def main(argv=None):
     is the code a scheduled job reads as 'a finding'."""
     _tolerate_odd_characters()
     try:
-        return _run(argv)
+        code = _run(argv)
+        # Flush here, inside the guard. A pipe that closed early fails at this
+        # flush when the output is small, and Python would otherwise fail
+        # again at exit and turn the exit status into 120.
+        if sys.stdout is not None:
+            sys.stdout.flush()
+        return code
     except Exception as exc:
         print("error: unexpected %s: %s. This is a fault in the tool, not a "
               "finding about the data." % (type(exc).__name__, exc),
               file=sys.stderr)
         traceback.print_exc()
+        _discard_stdout()
         return 70
+
+
+def _discard_stdout():
+    """Point stdout at the null device so the flush at exit cannot fail.
+    This is the recipe in the Python signal module docs for a closed pipe."""
+    try:
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+    except (OSError, ValueError, AttributeError):
+        # A stdout with no file descriptor (or none at all) has no exit flush
+        # to fail.
+        pass
 
 
 def _stamp_flag(name, text):
@@ -690,7 +720,7 @@ def _run_safe(args):
     try:
         source = read_csv(args.source, (key, stamp))
         applied_rows = read_csv(args.applied, (akey, astamp))
-    except (IOError, OSError, csv.Error) as exc:
+    except (IOError, OSError, csv.Error, UnreadableText) as exc:
         # csv.Error too. A NUL in the file, or a field over csv's limit, is an
         # unreadable input and not a watermark that failed.
         print("error: %s" % exc, file=sys.stderr)
@@ -927,7 +957,7 @@ def _self_test(tmp):
           "a watermark past the newest source stamp is AHEAD")
     f = frozen("2026-03-02 00:00:00", "2026-03-01 08:30:00",
                "2026-03-01 08:30:00", "2026-03-02 01:00:00")
-    check(codes(f) == ["AHEAD"], "AHEAD is judged against the view as well")
+    check(codes(f) == ["AHEAD"], "an AHEAD verdict is judged against the view as well")
     f = frozen("2026-03-02 00:00:00", "2026-01-05 00:00:00", None,
                "2026-03-02 01:00:00")
     check(codes(f) == ["STALE", "AHEAD"],
@@ -1006,7 +1036,7 @@ def _self_test(tmp):
     check(codes(r.findings) == ["SAFE"] and r.safe == T("2026-03-01 02:00:00"),
           "everything applied: SAFE, and the safe mark is the newest applied "
           "stamp")
-    check(gate(r.findings, r.compared) == 0, "SAFE exits 0")
+    check(gate(r.findings, r.compared) == 0, "a SAFE verdict exits 0")
     r = judge([("A", "2026-03-01 01:00:00"), ("B", "2026-03-01 07:00:00")],
               {"A": T("2026-03-01 01:00:00")})
     check(codes(r.findings) == ["SAFE"] and r.safe == T("2026-03-01 01:00:00"),
@@ -1479,8 +1509,43 @@ def _self_test(tmp):
         ["safemark", "--source", garbled, "--applied", ok_app,
          "--old-watermark", "2026-03-01 00:00:00", "--new-watermark",
          "2026-03-01 06:00:00"])
-    check(code == 1 and "A" + chr(0xFFFD) in out,
-          "bytes that are not UTF-8 are decoded lossily and the run goes on")
+    check(code == 2 and "byte 0xff at offset 11 is not UTF-8" in err
+          and "garbled.csv" in err and out == "",
+          "a source with bytes that are not UTF-8 exits 2 and names the "
+          "byte, and prints no verdict")
+    code, out, err = run_cli(
+        ["safemark", "--source", ok_app, "--applied", garbled,
+         "--old-watermark", "2026-03-01 00:00:00", "--new-watermark",
+         "2026-03-01 06:00:00"])
+    check(code == 2 and "garbled.csv" in err and out == "",
+          "so does an applied file with bytes that are not UTF-8")
+    cp_src = tmpfile("cp-src.csv", "")
+    with open(cp_src, "wb") as handle:
+        handle.write(b"KEY,STAMP\nM\xe9,2026-03-01 01:00:00\n"
+                     b"M\xeb,2026-03-01 00:30:00\nZ,2026-03-01 02:00:00\n")
+    cp_app = tmpfile("cp-app.csv", "")
+    with open(cp_app, "wb") as handle:
+        handle.write(b"KEY,STAMP\nM\xe9,2026-03-01 01:00:00\n"
+                     b"Z,2026-03-01 02:00:00\n")
+    code, out, err = run_cli(
+        ["safemark", "--source", cp_src, "--applied", cp_app,
+         "--old-watermark", "1900-01-01", "--new-watermark",
+         "2026-03-01 01:30:00"])
+    check(code == 2 and "SAFE" not in out and "offset 11" in err,
+          "a Windows-1252 export whose two keys would both decode to U+FFFD "
+          "is refused and never reads SAFE  <-- pinned defect")
+    utf_src = tmpfile("utf-src.csv", "KEY,STAMP\nM" + chr(0xe9)
+                      + ",2026-03-01 01:00:00\nM" + chr(0xeb)
+                      + ",2026-03-01 00:30:00\nZ,2026-03-01 02:00:00\n")
+    utf_app = tmpfile("utf-app.csv", "KEY,STAMP\nM" + chr(0xe9)
+                      + ",2026-03-01 01:00:00\nZ,2026-03-01 02:00:00\n")
+    code, out, err = run_cli(
+        ["safemark", "--source", utf_src, "--applied", utf_app,
+         "--old-watermark", "1900-01-01", "--new-watermark",
+         "2026-03-01 01:30:00"])
+    check(code == 1 and "STRANDED 1" in out,
+          "the same two keys written as UTF-8 stay two keys, and the "
+          "stranded one is found")
 
     huge = tmpfile("huge.csv", "KEY,STAMP\nA," + "x" * 200000 + "\n")
     code, out, err = run_cli(
@@ -1545,6 +1610,42 @@ def _self_test(tmp):
     check(code == 70 and "BrokenPipeError" in err_buf.getvalue(),
           "a closed stdout ends the run with exit 70 and no verdict, never a "
           "finding")
+
+    probe_path = tmpfile("flush-probe.txt", "")
+    probe_fd = os.open(probe_path, os.O_WRONLY | getattr(os, "O_BINARY", 0))
+
+    class DeadAtFlush(io.StringIO):
+        def flush(self):
+            raise OSError(22, "probe")
+
+        def fileno(self):
+            return probe_fd
+
+    err_buf = io.StringIO()
+    with contextlib.redirect_stdout(DeadAtFlush()), \
+            contextlib.redirect_stderr(err_buf):
+        code = main(fz)
+    os.write(probe_fd, b"x")
+    os.close(probe_fd)
+    check(code == 70 and "OSError" in err_buf.getvalue()
+          and os.path.getsize(probe_path) == 0,
+          "a pipe that dies at the flush after a short report exits 70 and "
+          "points stdout at the null device, so the exit flush cannot turn "
+          "it into 120  <-- pinned defect")
+    with contextlib.redirect_stdout(None), \
+            contextlib.redirect_stderr(io.StringIO()):
+        code = main(fz + ["--view-max", "2026-03-01 08:30:00"])
+    check(code == 1,
+          "a run with no stdout at all still returns its exit code")
+    read_end, write_end = os.pipe()
+    os.close(read_end)
+    child = subprocess.run(
+        [sys.executable, os.path.abspath(__file__)] + fz,
+        stdout=write_end, stderr=subprocess.PIPE)
+    os.close(write_end)
+    check(child.returncode == 70,
+          "a real child whose stdout pipe is already closed exits 70, not "
+          "120  <-- pinned defect")
 
     # ---- the CLI: verdicts that must not read as clean
     def sm(src_text, app_text, new_mark, old_mark="2026-02-01 00:00:00"):
