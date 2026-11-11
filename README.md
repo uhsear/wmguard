@@ -42,6 +42,8 @@ PASS  an unapplied row above the new mark (PENDING) also caps the safe mark: it 
 ...
 PASS  a mark past every source stamp is AHEAD even when nothing is stranded, and it exits 1  <-- pinned defect
 ...
+PASS  a mark poisoned by one future-dated row reads FUTURE on the watermark, the base MAX and the view MAX, and never FRESH  <-- pinned defect
+...
 PASS  a source with no readable stamp compared nothing: exit 4, not clean  <-- pinned defect
 ...
 PASS  rows all at or below the old mark are BEHIND, not compared: exit 4, no SAFE finding  <-- pinned defect
@@ -54,7 +56,7 @@ PASS  without --apply nothing is written  <-- pinned defect
 ...
 PASS  every key that starts with = + - @ comes out with a guard apostrophe in --out, and a plain key does not  <-- pinned defect
 ...
-PASS  --out lists every source row with its source stamp, so read back as --applied it turns the stranded rows APPLIED and the run exits 0: the README forbids this use  <-- pinned defect
+PASS  --out read back as --applied is refused with exit 64, because it lists the stranded rows with their source stamps and would read SAFE  <-- pinned defect
 ...
 PASS  an applied export that a spreadsheet guarded with an apostrophe still matches the source key, and the rows it does not list stay STRANDED  <-- pinned defect
 ...
@@ -75,10 +77,10 @@ PASS  --ap, a prefix of a write flag, is refused and writes nothing  <-- pinned 
 PASS  the module imports no network library, so it has no connection to leak a credential from  <-- pinned defect
 ...
 --------------------------------------------------------------------
-218 assertions, 0 failed
+226 assertions, 0 failed
 ```
 
-The full run prints all 218 assertions. Each `...` line above is where this block is cut.
+The full run prints all 226 assertions. Each `...` line above is where this block is cut.
 
 ## What already exists
 
@@ -118,10 +120,10 @@ day.
 
 Python 3.9 or newer and nothing else. No `arcpy`, no third-party package, no network, no database.
 
-The self-test prints the same 218 assertions on Windows (Python 3.13.2 and 3.12.10)
+The self-test prints the same 226 assertions on Windows (Python 3.13.2 and 3.12.10)
 and on Ubuntu (Python 3.9.25 and 3.12.3). The outputs are identical line for line, once the
 carriage returns that Windows adds are removed. `coverage run --branch wmguard.py --self-test`
-reports 100 percent of lines and branches (946 statements, 156 branches).
+reports 100 percent of lines and branches (969 statements, 162 branches).
 
 ```
 git clone https://github.com/uhsear/wmguard.git
@@ -222,23 +224,34 @@ wmguard frozenmark: watermark 2026-03-01 08:00:00, base MAX 2026-03-01 08:00:00,
 BASE_LAGS the view MAX 2026-03-01 08:20:00 is 0.3 h ahead of the base MAX 2026-03-01 08:00:00, and the base MAX is within the limit of 48.0 h. A versioned base table lags its view until the next compress, so this alone is not a freeze.
 VERDICT: no frozen MAX and no mark past the source found.
 exit 0
+
+$ python wmguard.py frozenmark --watermark "2099-01-01 00:00:00" --base-max "2099-01-01 00:00:00" --now "2026-03-01 09:00:00"
+wmguard frozenmark: watermark 2099-01-01 00:00:00, base MAX 2099-01-01 00:00:00, view MAX not given, now 2026-03-01 09:00:00, limit 48.0 h
+FUTURE    the watermark 2099-01-01 00:00:00 is 638487.0 h after now 2026-03-01 09:00:00, over the 12.0 h allowed for zone skew. Either a row carries a wrong date, and a mark taken from it skips every later row, or --now is wrong. The tool cannot tell which, so it does not call this fresh.
+FUTURE    the base MAX 2099-01-01 00:00:00 is 638487.0 h after now 2026-03-01 09:00:00, over the 12.0 h allowed for zone skew. Either a row carries a wrong date, and a mark taken from it skips every later row, or --now is wrong. The tool cannot tell which, so it does not call this fresh.
+VERDICT: 2 finding(s). Do not trust this watermark.
+exit 1
 ```
 
-The four runs show the cases that matter. The first run has a view that is 1328.5 hours ahead of
+The five runs show the cases that matter. The first run has a view that is 1328.5 hours ahead of
 the base, a base MAX over the age limit, and a mark equal to the base. The second run has an old
 base that the view does not pass, so the table is quiet and not frozen. The third run has no view.
 An old base MAX then looks the same whether the table is frozen or idle, so the tool says that and
 exits 1. In the fourth run the view is ahead by 20 minutes and the base is recent. A versioned
-table is in that state between compresses, so it is a note and the exit code is 0.
+table is in that state between compresses, so it is a note and the exit code is 0. In the fifth run
+one row with a typo year (2099) has set the base MAX, and the job stored it as the mark. Every later
+row is stamped below that mark, so none is ever selected. The age check cannot see this, because a
+stamp in the future is never old. The tool compares each stamp with `--now` and exits 1.
 
 | Code | Finding? | When |
 |---|---|---|
 | `FROZEN` | yes, exit 1 | The view MAX is ahead of the base MAX, the base MAX is older than `--max-age-hours`, and the mark is at or behind the base MAX. |
 | `STALE` | yes, exit 1 | No view was given, and the base MAX is older than `--max-age-hours`. |
+| `FUTURE` | yes, exit 1 | The mark, the base MAX or the view MAX is more than 12 hours after `--now`. The tolerance is `FUTURE_TOLERANCE_HOURS` in the file; it allows for a database clock in another zone. One finding per stamp. |
 | `AHEAD` | yes, exit 1 | The mark is past every stamp the source has. A row stamped at or below it that arrives later is never selected. |
 | `BASE_LAGS` | note | The view MAX is ahead of the base MAX, but the base MAX is within the age limit, or the mark is above the base MAX so it did not come from the base table. |
 | `IDLE` | note | The base MAX is old, but the view is not ahead of it. The table is quiet. |
-| `FRESH` | note | The base MAX is recent, and the mark is not past it. |
+| `FRESH` | note | The base MAX is recent, no stamp is in the future of `--now`, and the mark is not past the source. |
 
 `FROZEN` means that the base table lags its view now and has done so for longer than the limit,
 and that the mark sits where a job reading the base table would put it. One snapshot cannot show
@@ -247,7 +260,7 @@ that a table stopped moving. A blocked compress that is younger than `--max-age-
 MAX, so it is not flagged.
 
 The age limit is inclusive. A base MAX exactly at the limit is not stale, and one second over is.
-A base MAX in the future of `--now` is not stale. A view MAX behind the base MAX is not freeze
+A stamp more than 12 hours after `--now` is `FUTURE`, a finding, and never `FRESH`. A stamp up to 12 hours after `--now` (the limit is inclusive) is treated as zone skew. A view MAX behind the base MAX is not freeze
 evidence, because deleting the newest row lowers the view MAX.
 
 ## safemark: did the mark skip rows?
@@ -407,12 +420,14 @@ also warns that these techniques "are not reliable in Microsoft Excel after savi
 re-opening the CSV file", so this is a guard and not a proof.
 `=HYPERLINK("http://x.invalid","y")` is written as `'=HYPERLINK(...)`. Row numbers stay numbers.
 The reader removes one guard apostrophe from the key column of `--source` and `--applied`, so an
-applied export that a spreadsheet saved with the apostrophe still matches the source key. Never
-give an `--out` file back as `--applied`. It lists every source row with its source stamp,
-including the `STRANDED` and `PENDING` rows that were never applied. Read as an applied file, each
-of those rows looks applied, the safe mark jumps to the newest stamp, and the run exits 0. The
-self-test pins both sides: the spreadsheet-guarded applied file keeps the unlisted rows `STRANDED`,
-and the `--out` file read back as `--applied` hides them.
+applied export that a spreadsheet saved with the apostrophe still matches the source key. The
+tool refuses its own `--out` file as `--source` or `--applied`, with exit 64. The file lists every
+source row with its source stamp, including the `STRANDED` and `PENDING` rows that were never
+applied. Read as an applied file, each of those rows looked applied, the safe mark jumped to the
+newest stamp, and the run exited 0. The refusal tests the header: a file whose columns are exactly
+`row`, `key`, `stamp` and `class`, in that order, is the tool's own output. The self-test pins both
+sides: the spreadsheet-guarded applied file keeps the unlisted rows `STRANDED`, and the `--out`
+file is refused as `--applied` and as `--source`.
 
 If the applied file has rows and none has a readable key and stamp, the tool compares nothing and
 exits 4. A date format it does not read, such as `3/1/2026 1:10:00 AM`, would otherwise make every
@@ -470,6 +485,8 @@ stamp blank, or with every row at or below the old mark, would otherwise report 
   own edit rate. `48` is a guess.
 - **`--now` defaults to this machine's clock.** The stamps have no time zone, so the clock and the
   stamps must use the same zone. Pass `--now` from the database server's clock when they differ.
+  A stamp up to 12 hours after `--now` is allowed as zone skew, so a typo date that is less than
+  that far ahead is not caught as `FUTURE`. The 12 hours is a guess, set in the file.
 - **A duplicate key in the source** is judged row by row. Each row is `APPLIED` when its key's
   newest applied stamp is the same or newer.
 - **Keys are compared as trimmed text.** `P-1` and `p-1` are two keys, and so are `7` and `07`.
@@ -479,8 +496,11 @@ stamp blank, or with every row at or below the old mark, would otherwise report 
   such as a Windows-1252 export with accented names, exits 2 and names the file, the byte and its
   offset. Nothing is decoded lossily, so two keys never collapse into one. A BOM at the start of a UTF-8 file is removed. A NUL
   byte inside a file gives exit 2 on Python 3.9 and 3.10, where the csv module refuses it, and is
-  read as part of the text on Python 3.11 and later. A field over csv's default limit of 131072
-  characters gives exit 2 on every version.
+  read as part of the text on Python 3.11 and later. The change is the 3.11.0a2 entry "Add support
+  of null characters in csv" in the Python
+  [changelog](https://docs.python.org/3/whatsnew/changelog.html). A field over csv's default limit of 131072
+  characters gives exit 2 on every version. Its message does not name the file, so with two
+  inputs you cannot tell from the message which one it was.
 - **An empty file is a usage error.** A zero-byte `--source` or `--applied` exits 64 with "columns
   not in the CSV", and not 2.
 - **A header-only source** has no rows to compare. It exits 4 and prints no `SAFE` line.
@@ -530,7 +550,8 @@ stamp blank, or with every row at or below the old mark, would otherwise report 
 - **`--out` is written in place,** not through a temporary file. A failed write can leave a partial
   file, and the exit code is 2. The verdict is printed above the error. Delete the partial file
   before you run again, because `--out` refuses a path that exists.
-- **Do not close the pipe early.** A closed stdout, as in `| head`, ends the run with exit 70 and
+- **Do not close the pipe early.** On Windows 11 with Python 3.13.2 under Git Bash, `safemark ... --sample 3000 | head -1`
+  printed the first line and the run exited 70. A closed stdout, as in `| head`, ends the run with exit 70 and
   the verdict may not be delivered. The tool points stdout at the null device after the failure, so
   Python cannot fail again at exit and replace the 70 with its own 120. When the reader took the
   whole short report before it closed, the run keeps its normal code. The exit status of a
@@ -540,7 +561,7 @@ stamp blank, or with every row at or below the old mark, would otherwise report 
 - **Ctrl+C is not handled.** An interrupt ends the run with Python's own status and a traceback,
   and not with a code from the table above. That is a stop by the operator and not a finding.
 - **Both files are read into memory.** One run of 300,000 source rows and 297,000 applied rows took
-  about 11 seconds (10.5 to 11.6 over four runs) on a Windows workstation with Python 3.13.2. The
+  about 11 seconds, as a past measurement that this repository cannot repeat (10.5 to 11.6 over four runs) on a Windows workstation with Python 3.13.2. The
   keys were `K0` to `K299999`, the stamps were 20 seconds apart, and 2,549 rows were stranded. The
   generator of that file is not published, so the stranded count cannot be repeated. Under
   `cProfile`, 24 of 28 seconds went to `strptime`. That is one machine, so yours will differ. A
@@ -556,6 +577,19 @@ stamp blank, or with every row at or below the old mark, would otherwise report 
 - **A UTF-16 file without a byte-order mark** exits 2 on Python 3.9 and 3.10, where the csv module
   refuses its NUL bytes, and exits 64 on 3.11 and later. A UTF-16 file with a mark exits 64 on
   every version.
+- **The printed safe mark can be later than `--new-watermark`.** It is the newest applied stamp
+  below the oldest unapplied row, and it does not look at the mark you wrote. With an applied row at
+  05:00, a new mark of 03:00 and nothing stranded, the line reads `safe watermark: 05:00` and the
+  verdict is `SAFE`. The verdict is right: any mark at or below the safe mark skips nothing.
+- **Terminal output is lossy.** Stdout and stderr replace a character the console cannot encode
+  with `?`. Two keys that differ only in such characters print the same in the log. The CSV and the
+  verdict are not affected.
+- **The `--out` file has the default permissions** of the process (the umask, or the ACL the folder
+  passes down). It holds source keys, so write it to a folder only you can read.
+- **Another spreadsheet may show the apostrophe.** The guard is the OWASP single-quote advice, which
+  OWASP aims at Excel. A different program may display the apostrophe as part of the key.
+- **Only the exact header of `--out` is recognised as the tool's own file.** If you rename a column
+  or add one, the file is read as ordinary rows, and the hidden-stranded-rows problem above returns.
 - **A mark taken from the `_evw` view needs `--view-max`.** Without it, `frozenmark` compares the
   mark with the base MAX only, and a mark that is ahead of the base table reads as `AHEAD`
   (exit 1). Give `--view-max` for a job that reads the view.
@@ -568,7 +602,11 @@ stamp blank, or with every row at or below the old mark, would otherwise report 
   exit code, to tell them apart.
 - **A `--out` path that names a Windows device.** On Windows 11 with Python 3.13, `--out aux.csv
   --apply` wrote an ordinary file named `aux.csv`, and `--out nul` was refused as an existing path
-  (exit 64). Other Windows versions were not probed.
+  (exit 64). Other Windows versions were not probed. Microsoft's
+  [Naming Files, Paths, and Namespaces](https://learn.microsoft.com/en-us/windows/win32/fileio/naming-a-file)
+  lists `CON`, `PRN`, `AUX` and `NUL` as reserved names and says to avoid them "followed immediately
+  by an extension", so `aux.csv` is a name that page tells you not to use, even though it was
+  written here. Do not rely on either result.
 - **The seven-digit precision of `datetime2(7)`** comes from the Microsoft page in Sources, which
   lists "0 to 7 digits" and says the type is not time zone offset aware.
 - **Excel may drop the apostrophe** when it saves the file again. OWASP names a tab prefix inside

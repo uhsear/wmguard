@@ -61,6 +61,12 @@ DEFAULT_MAX_AGE_HOURS = 48.0
 # datetime.timedelta can hold, so an absurd value is a usage error and not a crash.
 MAX_AGE_LIMIT_HOURS = 1000000.0
 
+# A stamp later than now by more than this is a future stamp. A database clock
+# in UTC read against a local clock differs by hours, so a small lead is skew.
+# Beyond it, either a row carries a wrong date (a typo year) and a mark taken
+# from it skips every later row, or --now is wrong. The tool cannot tell which.
+FUTURE_TOLERANCE_HOURS = 12.0
+
 DEFAULT_SAMPLE = 10
 
 DEFAULT_KEY_FIELD = "KEY"
@@ -124,6 +130,10 @@ def judge_frozen(watermark, base_max, view_max, now, max_age):
     MAX read through the current-state view, or None when it was not given.
     max_age is a timedelta. Pure: no clock, no I/O.
 
+    A watermark, base MAX or view MAX more than FUTURE_TOLERANCE_HOURS after
+    now is FUTURE, a finding: age cannot show a poisoned mark, because a stamp
+    in the future is never old.
+
     One snapshot cannot show that a table stopped moving. A versioned base
     table lags its view between compresses, so FROZEN needs three things at
     once: the view is ahead, the base MAX is older than max_age, and the mark
@@ -183,6 +193,18 @@ def judge_frozen(watermark, base_max, view_max, now, max_age):
             "the watermark %s is past every stamp in the source (newest "
             "%s). A row that arrives stamped at or below it is never "
             "selected." % (fmt_stamp(watermark), fmt_stamp(ceiling))))
+    tolerance = datetime.timedelta(hours=FUTURE_TOLERANCE_HOURS)
+    for name, stamp in (("watermark", watermark), ("base MAX", base_max),
+                        ("view MAX", view_max)):
+        if stamp is not None and stamp - now > tolerance:
+            out.append(Finding(
+                "FUTURE", True,
+                "the %s %s is %.1f h after now %s, over the %.1f h allowed "
+                "for zone skew. Either a row carries a wrong date, and a "
+                "mark taken from it skips every later row, or --now is "
+                "wrong. The tool cannot tell which, so it does not call "
+                "this fresh." % (name, fmt_stamp(stamp), hours(stamp - now),
+                                 fmt_stamp(now), FUTURE_TOLERANCE_HOURS)))
     if not out:
         out.append(Finding(
             "FRESH", False,
@@ -469,6 +491,9 @@ def describe_safe(report, sample):
     return lines
 
 
+OUT_FIELDS = ["row", "key", "stamp", "class"]
+
+
 def classified_rows(report):
     return [{"row": r.number, "key": cell(r.key),
              "stamp": "" if r.stamp is None else fmt_stamp(r.stamp),
@@ -480,7 +505,7 @@ def write_classified(path, report):
     # "x", not "w": the file must not exist, so a path that appeared after
     # the check in _run_safe still cannot be overwritten.
     with open(path, "x", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, ["row", "key", "stamp", "class"])
+        writer = csv.DictWriter(handle, OUT_FIELDS)
         writer.writeheader()
         writer.writerows(classified_rows(report))
 
@@ -514,6 +539,12 @@ def read_csv(path, fields):
     reader = csv.DictReader(io.StringIO(text, newline=""))
     header = [h.strip() for h in (reader.fieldnames or [])]
     reader.fieldnames = header
+    if header == OUT_FIELDS:
+        raise ValueError(
+            "%s: this is a classification file that wmguard wrote with "
+            "--out. It lists every source row, stranded ones included, so "
+            "read as source or applied rows it hides what it classified. "
+            "Export the rows the sync really applied." % path)
     absent = [f for f in fields if f not in header]
     if absent:
         raise ValueError(
@@ -939,10 +970,41 @@ def _self_test(tmp):
     f = frozen("2026-03-01 00:00:00", "2026-03-01 00:00:00", None,
                "2026-03-01 06:00:01", age_hours=6.0)
     check(codes(f) == ["STALE"], "the limit is the operator's, not fixed")
-    f = frozen("2026-03-01 00:00:00", "2026-03-01 00:00:00", None,
+    f = frozen("2026-01-05 00:00:00", "2026-03-01 00:00:00", None,
                "2026-02-01 00:00:00")
+    check(codes(f) == ["FUTURE"] and f[0].is_finding,
+          "a base MAX 28 days after now is a FUTURE finding, not FRESH  "
+          "<-- pinned defect")
+    check("base MAX 2026-03-01" in f[0].message
+          and "672.0 h after now" in f[0].message,
+          "and the message names the stamp that is in the future and by "
+          "how much")
+    f = frozen("2026-03-01 00:00:00", "2026-03-01 00:00:00", None,
+               "2026-02-28 12:00:00")
     check(codes(f) == ["FRESH"],
-          "a base MAX in the future of now (clock skew) is not stale")
+          "a base MAX exactly 12 h after now is zone skew: the tolerance "
+          "is inclusive")
+    f = frozen("2026-01-05 00:00:00", "2026-03-01 00:00:00", None,
+               "2026-02-28 11:59:59")
+    check(codes(f) == ["FUTURE"],
+          "and one second over the tolerance is FUTURE")
+    f = frozen("2099-01-01 00:00:00", "2026-03-01 00:00:00", None,
+               "2026-03-01 08:00:00")
+    check(sorted(codes(f)) == ["AHEAD", "FUTURE"]
+          and "watermark 2099" in f[-1].message,
+          "a watermark in the future is FUTURE as well as AHEAD  <-- "
+          "pinned defect")
+    f = frozen("2026-03-01 00:00:00", "2026-03-01 00:00:00",
+               "2099-01-01 00:00:00", "2026-03-01 08:00:00")
+    check("FUTURE" in codes(f) and "view MAX 2099" in
+          [x for x in f if x.code == "FUTURE"][0].message,
+          "a view MAX in the future is FUTURE  <-- pinned defect")
+    f = frozen("2099-01-01 00:00:00", "2099-01-01 00:00:00",
+               "2099-01-01 00:00:00", "2026-03-01 08:00:00")
+    check(codes(f) == ["FUTURE"] * 3 and "FRESH" not in codes(f),
+          "a mark poisoned by one future-dated row reads FUTURE on the "
+          "watermark, the base MAX and the view MAX, and never FRESH  <-- "
+          "pinned defect")
 
     # ---- frozenmark: a quiet table is not a frozen one
     f = frozen("2026-01-05 00:00:00", "2026-01-05 00:00:00",
@@ -1248,8 +1310,16 @@ def _self_test(tmp):
     code, out, err = run_cli(
         ["frozenmark", "--watermark", "9998-01-01 00:00:00", "--base-max",
          "9998-01-01 00:00:00"])
-    check(code == 0 and "FRESH" in out,
-          "and a base MAX in the far future of the clock is fresh")
+    check(code == 1 and "FUTURE" in out and "FRESH" not in out
+          and "no frozen MAX" not in out,
+          "and a base MAX in the far future of the clock exits 1, never a "
+          "clean verdict  <-- pinned defect")
+    code, out, err = run_cli(
+        ["frozenmark", "--watermark", "2026-01-05", "--base-max",
+         "2026-01-05", "--now", "2025-03-02"])
+    check(code == 1 and "FUTURE" in out and "FRESH" not in out,
+          "a --now earlier than the base MAX is FUTURE too: a wrong clock "
+          "is not called fresh  <-- pinned defect")
     code, out, err = run_cli(fz + ["--max-age-hours", "-1"])
     check(code == 64 and "between 0 and" in err and out == "",
           "a negative age limit is a usage error that prints nothing to "
@@ -1422,10 +1492,15 @@ def _self_test(tmp):
         formula_sw[:4] + [formula_out, "--applied-key-field", "key",
                           "--applied-stamp-field", "stamp"]
         + formula_sw[5:])
-    check(code == 0 and "APPLIED 9" in out and "STRANDED 0" in out,
-          "--out lists every source row with its source stamp, so read "
-          "back as --applied it turns the stranded rows APPLIED and the "
-          "run exits 0: the README forbids this use  <-- pinned defect")
+    check(code == 64 and "classification file" in err and out == "",
+          "--out read back as --applied is refused with exit 64, because "
+          "it lists the stranded rows with their source stamps and would "
+          "read SAFE  <-- pinned defect")
+    code, out, err = run_cli(
+        formula_sw[:2] + [formula_out] + formula_sw[3:]
+        + ["--key-field", "key", "--stamp-field", "stamp"])
+    check(code == 64 and "classification file" in err,
+          "and the same file given as --source is refused")
     formula_sheet = tmpfile(
         "formula-sheet.csv",
         "key,stamp\n'+1+1,2026-03-01 01:10:00\n'-2+3,2026-03-01 01:20:00\n"
