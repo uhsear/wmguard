@@ -322,7 +322,8 @@ class SafeReport(object):
         self.findings = findings
         self.applied_unusable = applied_unusable
         self.counts = dict((c, verdicts.count(c)) for c in CLASSES)
-        self.compared = len(verdicts) - self.counts[UNDATED]
+        self.compared = (len(verdicts) - self.counts[UNDATED]
+                         - self.counts[BEHIND])
         self.why = None
         if applied_unusable:
             self.compared = 0
@@ -331,9 +332,9 @@ class SafeReport(object):
                         "date format and the column names of the applied "
                         "file.")
         elif self.compared == 0:
-            self.why = ("No source row can be judged: each has a blank key "
-                        "or a stamp the tool cannot read, or the source has "
-                        "no row.")
+            self.why = ("No source row can be judged: each is at or below "
+                        "the old watermark, has a blank key or a stamp the "
+                        "tool cannot read, or the source has no row.")
 
 
 def judge_safe(rows, applied, unreadable, old, new):
@@ -384,7 +385,7 @@ def judge_safe(rows, applied, unreadable, old, new):
             "have skipped them, or they were never meant to be applied, and "
             "the tool cannot tell which. Pass an early --old-watermark, such "
             "as 1900-01-01, to judge the whole history." % outside))
-    compared = len(verdicts) - undated
+    compared = len(verdicts) - undated - verdicts.count(BEHIND)
     if not findings and compared:
         findings.append(Finding(
             "SAFE", False, "the new watermark skips no unapplied row above "
@@ -1098,6 +1099,12 @@ def _self_test(tmp):
     check(r.compared == 0 and gate(r.findings, r.compared) == 4,
           "a source with no readable stamp compared nothing: exit 4, not "
           "clean  <-- pinned defect")
+    r = judge([("A", "2026-02-01 01:00:00")], {"A": T("2026-02-01 01:00:00")},
+              o=T("2026-02-01 01:00:00"), n=T("2026-02-01 01:00:00"))
+    check(r.compared == 0 and gate(r.findings, r.compared) == 4
+          and codes(r.findings) == [] and "old watermark" in r.why,
+          "rows all at or below the old mark are BEHIND, not compared: "
+          "exit 4, no SAFE finding  <-- pinned defect")
     r = judge([], {})
     check(r.compared == 0 and gate(r.findings, r.compared) == 4
           and codes(r.findings) == [] and r.why is not None,
@@ -1416,8 +1423,21 @@ def _self_test(tmp):
                           "--applied-stamp-field", "stamp"]
         + formula_sw[5:])
     check(code == 0 and "APPLIED 9" in out and "STRANDED 0" in out,
-          "the --out file read back as the applied file gives every key "
-          "back, so the round trip is lossless  <-- pinned defect")
+          "--out lists every source row with its source stamp, so read "
+          "back as --applied it turns the stranded rows APPLIED and the "
+          "run exits 0: the README forbids this use  <-- pinned defect")
+    formula_sheet = tmpfile(
+        "formula-sheet.csv",
+        "key,stamp\n'+1+1,2026-03-01 01:10:00\n'-2+3,2026-03-01 01:20:00\n"
+        "P-1,2026-03-01 02:10:00\n")
+    code, out, err = run_cli(
+        formula_sw[:4] + [formula_sheet, "--applied-key-field", "key",
+                          "--applied-stamp-field", "stamp"]
+        + formula_sw[5:])
+    check(code == 1 and "APPLIED 3" in out and "STRANDED 6" in out,
+          "an applied export that a spreadsheet guarded with an "
+          "apostrophe still matches the source key, and the rows it does "
+          "not list stay STRANDED  <-- pinned defect")
 
     nul_dest = os.path.join(tmp, "refused.csv")
     code, out, err = run_cli(
@@ -1727,6 +1747,16 @@ def _self_test(tmp):
     code, out, err = sm("KEY,STAMP\n", "KEY,STAMP\n", "2026-03-01")
     check(code == 4 and "SAFE  " not in out and "nothing was compared" in out,
           "a header-only source exits 4 and prints no SAFE line")
+    code, out, err = sm("KEY,STAMP\nA,2026-02-01 01:00:00\n"
+                        "B,2026-02-02 01:00:00\n",
+                        "KEY,STAMP\nA,2026-02-01 01:00:00\n"
+                        "B,2026-02-02 01:00:00\n", "2026-02-02 01:00:00",
+                        "2026-03-01 00:00:00")
+    check(code == 4 and "BEHIND 2" in out and "APPLIED 0" in out
+          and "SAFE  " not in out and "nothing was compared" in out
+          and "VERDICT: no skipped row" not in out,
+          "a source whose every row is at or below the old mark judged "
+          "nothing: exit 4 and no SAFE line, not exit 0  <-- pinned defect")
 
     # ---- the CLI: usage
     check(run_cli([])[0] == 64, "no mode and no --self-test is a usage error")

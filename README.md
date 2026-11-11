@@ -34,45 +34,51 @@ PASS  a watermark equal to a frozen base MAX, with the view ahead, is FROZEN  <-
 ...
 PASS  a base MAX inside the age limit that the view is ahead of is the normal state between compresses: a note, exit 0  <-- pinned defect
 ...
-PASS  a row in the window with a blank key is UNDATED, never guessed APPLIED  <-- pinned defect
-...
 PASS  an unapplied row inside the window is STRANDED  <-- pinned defect
 ...
-PASS  an unapplied row above the new mark (PENDING) also caps the safe mark: it never rises past a row the next run still needs  <-- pinned defect
+PASS  a row in the window with a blank key is UNDATED, never guessed APPLIED  <-- pinned defect
 ...
-PASS  an unapplied row at or below the old mark is a finding, not a clean exit 0 over a row the tool could not judge  <-- pinned defect
+PASS  an unapplied row above the new mark (PENDING) also caps the safe mark: it never rises past a row the next run still needs  <-- pinned defect
 ...
 PASS  a mark past every source stamp is AHEAD even when nothing is stranded, and it exits 1  <-- pinned defect
 ...
 PASS  a source with no readable stamp compared nothing: exit 4, not clean  <-- pinned defect
 ...
+PASS  rows all at or below the old mark are BEHIND, not compared: exit 4, no SAFE finding  <-- pinned defect
+...
+PASS  an unapplied row at or below the old mark is a finding, not a clean exit 0 over a row the tool could not judge  <-- pinned defect
+...
 PASS  an applied file with rows and none readable compares nothing, instead of reporting every row STRANDED  <-- pinned defect
 ...
 PASS  without --apply nothing is written  <-- pinned defect
 ...
-PASS  a credential file given by mistake never reaches stderr or stdout  <-- pinned defect
-...
 PASS  every key that starts with = + - @ comes out with a guard apostrophe in --out, and a plain key does not  <-- pinned defect
 ...
-PASS  the --out file read back as the applied file gives every key back, so the round trip is lossless  <-- pinned defect
+PASS  --out lists every source row with its source stamp, so read back as --applied it turns the stranded rows APPLIED and the run exits 0: the README forbids this use  <-- pinned defect
+...
+PASS  an applied export that a spreadsheet guarded with an apostrophe still matches the source key, and the rows it does not list stay STRANDED  <-- pinned defect
 ...
 PASS  --out naming any other existing file is refused, not overwritten  <-- pinned defect
 ...
-PASS  and a zero value counts as given: 0 is not False  <-- pinned defect
+PASS  a credential file given by mistake never reaches stderr or stdout  <-- pinned defect
 ...
 PASS  a Windows-1252 export whose two keys would both decode to U+FFFD is refused and never reads SAFE  <-- pinned defect
 ...
 PASS  a pipe that dies at the flush after a short report exits 70 and points stdout at the null device, so the exit flush cannot turn it into 120  <-- pinned defect
+...
+PASS  a source whose every row is at or below the old mark judged nothing: exit 4 and no SAFE line, not exit 0  <-- pinned defect
+...
+PASS  and a zero value counts as given: 0 is not False  <-- pinned defect
 ...
 PASS  --ap, a prefix of a write flag, is refused and writes nothing  <-- pinned defect
 ...
 PASS  the module imports no network library, so it has no connection to leak a credential from  <-- pinned defect
 ...
 --------------------------------------------------------------------
-215 assertions, 0 failed
+218 assertions, 0 failed
 ```
 
-The full run prints all 215 assertions. Each `...` line above is where this block is cut.
+The full run prints all 218 assertions. Each `...` line above is where this block is cut.
 
 ## What already exists
 
@@ -112,10 +118,10 @@ day.
 
 Python 3.9 or newer and nothing else. No `arcpy`, no third-party package, no network, no database.
 
-The self-test prints the same 215 assertions on Windows (Python 3.13.2 and 3.12.10)
+The self-test prints the same 218 assertions on Windows (Python 3.13.2 and 3.12.10)
 and on Ubuntu (Python 3.9.25 and 3.12.3). The outputs are identical line for line, once the
 carriage returns that Windows adds are removed. `coverage run --branch wmguard.py --self-test`
-reports 100 percent of lines and branches (939 statements, 156 branches).
+reports 100 percent of lines and branches (946 statements, 156 branches).
 
 ```
 git clone https://github.com/uhsear/wmguard.git
@@ -356,7 +362,9 @@ stays too, because `P-090` is still below the old mark and still not applied. Ei
 accept the loss and give the next run an old mark above it.
 
 `--out rows.csv --apply` writes one line per source row. Without `--apply`, the same run prints
-"Check only" and writes nothing. This is the file from the run above:
+"Check only" and writes nothing. This is the file that the first run above writes when you add
+`--out rows.csv --apply` to it (new mark `2026-03-01 06:00:00`, so `P-102` and `P-104` are
+`STRANDED`):
 
 ```
 row,key,stamp,class
@@ -379,7 +387,7 @@ Other findings of this mode:
 | `AHEAD` | yes, exit 1 | The new mark is past the newest source stamp. This fires when no row is stranded. A mark set to the wall clock, and not to a data value, does this. |
 | `REGRESSED` | note | The new mark is behind the old one. Rows between them are selected twice and none is lost. |
 | `OUTSIDE` | yes, exit 1 | At least one row at or below the old mark is not in the applied file. This run does not judge it, and it cannot tell a skipped row from one never meant to be applied. |
-| `SAFE` | note | None of the findings or notes above, and at least one row was compared. |
+| `SAFE` | note | None of the findings or notes above, and at least one row was judged in the window (not `BEHIND`, not `UNDATED`). |
 
 A row that was applied and then edited is `STRANDED` or `PENDING` at its new stamp, because the
 applied file shows the older stamp. A key that appears twice in the applied file keeps its newest
@@ -398,9 +406,13 @@ with one of the six. It does not guard the line feed or the full-width forms (se
 also warns that these techniques "are not reliable in Microsoft Excel after saving and
 re-opening the CSV file", so this is a guard and not a proof.
 `=HYPERLINK("http://x.invalid","y")` is written as `'=HYPERLINK(...)`. Row numbers stay numbers.
-The reader removes the apostrophe again, so `--out` can be the `--applied` file of a later run
-(`--applied-key-field key --applied-stamp-field stamp`). The self-test runs that round trip with
-nine keys, and writes the file with the real `--apply` path.
+The reader removes one guard apostrophe from the key column of `--source` and `--applied`, so an
+applied export that a spreadsheet saved with the apostrophe still matches the source key. Never
+give an `--out` file back as `--applied`. It lists every source row with its source stamp,
+including the `STRANDED` and `PENDING` rows that were never applied. Read as an applied file, each
+of those rows looks applied, the safe mark jumps to the newest stamp, and the run exits 0. The
+self-test pins both sides: the spreadsheet-guarded applied file keeps the unlisted rows `STRANDED`,
+and the `--out` file read back as `--applied` hides them.
 
 If the applied file has rows and none has a readable key and stamp, the tool compares nothing and
 exits 4. A date format it does not read, such as `3/1/2026 1:10:00 AM`, would otherwise make every
@@ -413,12 +425,12 @@ source row look unapplied, and a scheduled job could not tell that from a real f
 | 0 | Nothing found. Notes may still print. |
 | 1 | At least one finding. |
 | 2 | A file could not be read or is not UTF-8 text, or `--out` could not be written. |
-| 4 | Nothing was compared: no source row could be judged, or no applied row was readable. |
+| 4 | Nothing was compared: no source row could be judged (each is `BEHIND`, `UNDATED` or absent), or no applied row was readable. |
 | 64 | Usage error: a bad flag, a bad stamp, a wrong-mode flag, an empty flag value, an existing `--out`, or a column the file lacks. |
 | 70 | An unexpected crash in the tool. It is never a finding about the data. |
 
-Exit 4 is not exit 0 on purpose. A source that was exported with the wrong column, or with every
-stamp blank, would otherwise report a clean run. A scheduled job reads 0 as "safe".
+Exit 4 is not exit 0 on purpose. A source that was exported with the wrong column, with every
+stamp blank, or with every row at or below the old mark, would otherwise report a clean run. A scheduled job reads 0 as "safe".
 
 ## Limits
 
@@ -484,7 +496,9 @@ stamp blank, would otherwise report a clean run. A scheduled job reads 0 as "saf
   `@`, a tab or a CR with one apostrophe in front, and the reader removes exactly one such
   apostrophe from the key column of `--source` and `--applied`. A source key that is already
   written as an apostrophe followed by one of those characters, such as `'=x`, is therefore read
-  as `=x` and written as `'=x`. That is the one key the file does not copy byte for byte. Keys are
+  as `=x` and written as `'=x`. That is the one key the file does not copy byte for byte, so the
+  guard is lossless for every key except one that already starts with an apostrophe followed by
+  one of those characters. Keys are
   trimmed before they are written, so a tab or CR at the start of a key never reaches the guard
   through the CLI. The guard still covers both, and the self-test calls it with both. The guard covers
   these six characters only, and only after the key is trimmed. Two source
@@ -497,10 +511,11 @@ stamp blank, would otherwise report a clean run. A scheduled job reads 0 as "saf
   a byte-order mark in front of `=` hides the formula character from the guard, so that key is
   written unguarded. A leading no-break space is removed by the trim, so that key is guarded and
   written without the space, and not byte for byte.
-- **A safemark run can judge nothing above the old mark and still print `SAFE`.** If every source
-  row is at or below `--old-watermark`, and the new mark is not past the newest stamp, the window
-  is empty and the run exits 0. The window line is the only sign. Pass an early `--old-watermark` to
-  audit history.
+- **A safemark run with an empty window exits 4.** If every source row is at or below
+  `--old-watermark`, the run judged no row. It prints `BEHIND n` and "nothing was compared", never
+  a `SAFE` line. A sync that really had nothing new to apply therefore exits 4 too. The tool
+  cannot tell an idle sync from a wrong old mark. A scheduler should treat 4 as "check", not as
+  failure of the job.
 - **An applied file that carries a load time can look applied.** If every applied stamp is later
   than the source stamp, every row is `APPLIED` and the run exits 0. The tool cannot tell a load
   time from a copied source stamp. The rule above, that the applied file carries the source stamp,
@@ -545,15 +560,32 @@ stamp blank, would otherwise report a clean run. A scheduled job reads 0 as "saf
   mark with the base MAX only, and a mark that is ahead of the base table reads as `AHEAD`
   (exit 1). Give `--view-max` for a job that reads the view.
 - **Keys that begin with a minus sign,** including negative integers such as `-3`, are written to
-  `--out` with a guard apostrophe. The reader removes it, so the round trip is lossless, but a
+  `--out` with a guard apostrophe. The reader removes it from `--source` and `--applied`, and a
   spreadsheet shows the apostrophe.
 - **`--out` is written with CRLF line endings,** the default of Python's csv module, on every
   platform.
 - **A red self-test exits 1,** the same code as a finding. Read the `0 failed` footer, not only the
   exit code, to tell them apart.
-- **A `--out` path that names a Windows device,** such as `aux.csv`, was not probed.
-- **The seven-digit precision of `datetime2(7)`** is stated from SQL Server documentation that this
-  README does not cite.
+- **A `--out` path that names a Windows device.** On Windows 11 with Python 3.13, `--out aux.csv
+  --apply` wrote an ordinary file named `aux.csv`, and `--out nul` was refused as an existing path
+  (exit 64). Other Windows versions were not probed.
+- **The seven-digit precision of `datetime2(7)`** comes from the Microsoft page in Sources, which
+  lists "0 to 7 digits" and says the type is not time zone offset aware.
+- **Excel may drop the apostrophe** when it saves the file again. OWASP names a tab prefix inside
+  the quoted field as an Excel-resistant alternative. The tool does not use it, because it would
+  change the key data.
+- **The guard covers `=`, `+`, `-`, `@`, tab and CR only.** A key that starts with a percent sign,
+  a pipe or a zero-width character is written as it is.
+- **A repeated column name in a header** is not refused. The reader keeps the value of the last
+  column with that name, so `KEY,KEY,STAMP` reads the second column as the key.
+- **A wrong stamp flag is echoed.** The message for a bad `--old-watermark` and the other stamp
+  flags repeats the text you typed, so do not type a secret into one.
+- **Keys are printed to the log.** The `STRANDED` and `UNDATED` sample lines print source keys. Point
+  `--source` and `--applied` only at data you accept to see in the log. A byte that is not UTF-8 is
+  named with its offset in the exit 2 message, so one byte of a wrongly supplied file can reach
+  stderr.
+- **A killed self-test can leave a directory** named `wmguard-selftest-*` in the temp folder. Delete
+  any that remain.
 - **The compress-to-delta-table behaviour in the opening** is an inference from the Esri pages in
   Sources, not a quoted statement.
 - It opens no socket and imports no network module, so no credential can leak from it. The
@@ -583,6 +615,9 @@ stamp blank, would otherwise report a clean run. A scheduled job reads 0 as "saf
   "When SET ANSI_NULLS is ON, an operator that has one or two NULL expressions returns UNKNOWN." A
   Boolean expression "filter[s] the rows that qualify" in a `WHERE` clause. That an UNKNOWN row does
   not qualify is my reading of the page.
+- Microsoft, [datetime2 (Transact-SQL)](https://learn.microsoft.com/en-us/sql/t-sql/data-types/datetime2-transact-sql):
+  precision "0 to 7 digits, with an accuracy of 100 nanoseconds (100 ns)", and "Time zone offset
+  aware and preservation": "No".
 - Microsoft, [datetime (Transact-SQL)](https://learn.microsoft.com/en-us/sql/t-sql/data-types/datetime-transact-sql):
   accuracy "Rounded to increments of .000, .003, or .007 seconds", and time zone offset aware: "No".
 - OWASP, [CSV Injection](https://community.owasp.org/attacks/CSV_Injection): the characters that
