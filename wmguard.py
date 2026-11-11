@@ -201,9 +201,11 @@ def _guarded(value):
 
 
 def cell(value):
-    """A text cell for the CSV that a spreadsheet will not run as a formula.
+    """A text cell for the CSV that no longer starts with a formula character.
 
     A cell that starts with = + - @ tab or CR gets one apostrophe in front.
+    That is the OWASP single-quote advice. Excel may drop the apostrophe when
+    the file is saved and opened again, so this is a guard and not a proof.
     A value that already starts with an apostrophe before such a character
     gets one more, so uncell() gives back exactly what went in."""
     if _guarded(value):
@@ -284,13 +286,16 @@ def safe_watermark(rows, verdicts, old):
     """A mark that skips no unapplied row.
 
     Selection is strictly greater than the mark, so the mark must sit below the
-    oldest unapplied stamp. The answer is the newest applied stamp under that,
+    oldest unapplied stamp. A row above the old mark with a blank key counts as
+    unapplied here, because it cannot be matched. A row with no readable stamp
+    has no place on the time line, so no mark accounts for it. The answer is the newest applied stamp under that,
     or old when there is none. Any lower mark is safe too, only slower.
     An applied row that shares the oldest unapplied stamp is selected again
     next run, so the apply step has to be safe to repeat.
     """
     unapplied = [r.stamp for r, v in zip(rows, verdicts)
-                 if v in (STRANDED, PENDING)]
+                 if v in (STRANDED, PENDING)
+                 or (v == UNDATED and r.stamp is not None)]
     done = [r.stamp for r, v in zip(rows, verdicts) if v == APPLIED]
     if unapplied:
         floor = min(unapplied)
@@ -369,20 +374,21 @@ def judge_safe(rows, applied, unreadable, old, new):
             "REGRESSED", False,
             "the new watermark is behind the old one, so rows between them "
             "are selected again. Safe only if applying a row twice is safe."))
+    outside = sum(1 for r, v in zip(rows, verdicts)
+                  if v == BEHIND and not is_applied(r, applied))
+    if outside:
+        findings.append(Finding(
+            "OUTSIDE", True,
+            "%d unapplied row(s) have a stamp at or below the old "
+            "watermark, so this run does not judge them. An earlier run may "
+            "have skipped them, or they were never meant to be applied, and "
+            "the tool cannot tell which. Pass an early --old-watermark, such "
+            "as 1900-01-01, to judge the whole history." % outside))
     compared = len(verdicts) - undated
     if not findings and compared:
         findings.append(Finding(
             "SAFE", False, "the new watermark skips no unapplied row above "
             "the old watermark."))
-    outside = sum(1 for r, v in zip(rows, verdicts)
-                  if v == BEHIND and not is_applied(r, applied))
-    if outside:
-        findings.append(Finding(
-            "OUTSIDE", False,
-            "%d unapplied row(s) have a stamp at or below the old "
-            "watermark, so this run does not judge them. An earlier run may "
-            "have skipped them. Pass an early --old-watermark, such as "
-            "1900-01-01, to judge the whole history." % outside))
     return SafeReport(rows, verdicts, old, new, safe, unreadable, findings)
 
 
@@ -1078,13 +1084,14 @@ def _self_test(tmp):
                ("C", "2026-03-01 01:00:00")],
               {"B": T("2026-02-28 02:00:00"), "C": T("2026-03-01 01:00:00")},
               n=T("2026-03-01 01:00:00"))
-    check(codes(r.findings) == ["SAFE", "OUTSIDE"]
-          and not r.findings[1].is_finding
-          and r.findings[1].message.startswith("1 unapplied row(s)")
-          and "1900-01-01" in r.findings[1].message
-          and gate(r.findings, r.compared) == 0,
-          "an unapplied row at or below the old mark is reported as a note, "
-          "not hidden behind a clean verdict  <-- pinned defect")
+    check(codes(r.findings) == ["OUTSIDE"]
+          and r.findings[0].is_finding
+          and r.findings[0].message.startswith("1 unapplied row(s)")
+          and "1900-01-01" in r.findings[0].message
+          and gate(r.findings, r.compared) == 1,
+          "an unapplied row at or below the old mark is a finding, not a "
+          "clean exit 0 over a row the tool could not judge  <-- pinned "
+          "defect")
     r = judge([("A", "2026-02-28 01:00:00")], {"A": T("2026-02-28 01:00:00")})
     check("OUTSIDE" not in codes(r.findings),
           "and an applied row below the old mark is not reported")
@@ -1095,6 +1102,22 @@ def _self_test(tmp):
           and gate(r.findings, r.compared) == 1,
           "rows with a blank key are UNDATED and the run exits 1, not 0  "
           "<-- pinned defect")
+    r = judge([("A", "2026-03-01 01:00:00"), ("", "2026-03-01 02:00:00"),
+               ("C", "2026-03-01 03:00:00")],
+              {"A": T("2026-03-01 01:00:00"), "C": T("2026-03-01 03:00:00")},
+              n=T("2026-03-01 06:00:00"))
+    check(r.safe == T("2026-03-01 01:00:00"),
+          "a blank-key row in the window holds the safe mark below its own "
+          "stamp, because it cannot be shown applied  <-- pinned defect")
+    r = judge([("A", "2026-03-01 01:00:00"), ("B", None),
+               ("C", "2026-03-01 03:00:00")],
+              {"A": T("2026-03-01 01:00:00"), "C": T("2026-03-01 03:00:00")},
+              n=T("2026-03-01 06:00:00"))
+    check(r.verdicts == [APPLIED, UNDATED, APPLIED]
+          and r.safe == T("2026-03-01 03:00:00")
+          and gate(r.findings, r.compared) == 1,
+          "a row with an unreadable stamp has no place on the time line, so "
+          "it does not move the safe mark, and it still exits 1")
     r = judge([("A", "2026-03-01 01:00:00")], {}, unreadable=2)
     check(r.applied_unusable and r.compared == 0 and r.findings == []
           and gate(r.findings, r.compared) == 4 and "date format" in r.why,
@@ -1230,7 +1253,7 @@ def _self_test(tmp):
     code, out, err = run_cli(sw)
     check(code == 1 and "STRANDED 1" in out and "row 2  key B" in out
           and "safe watermark: 2026-03-01 01:00:00" in out
-          and "VERDICT: 1 finding(s)" in out,
+          and "VERDICT: 2 finding(s)" in out and "OUTSIDE" in out,
           "safemark names the skipped row, the safe mark and exits 1")
     check("applied file: 1 row(s) with no readable key or stamp" in out,
           "and reports the applied rows it could not read")
@@ -1293,7 +1316,7 @@ def _self_test(tmp):
           and len(written.splitlines()) == 6,
           "with --apply the classification is written, one line per row")
 
-    # ---- the CSV is safe to open in a spreadsheet
+    # ---- the CSV cell no longer starts with a formula character
     for lead, name in (("=", "equals"), ("+", "plus"), ("-", "minus"),
                        ("@", "at sign"), ("\t", "tab"), ("\r", "CR")):
         check(cell(lead + "x") == "'" + lead + "x"
@@ -1559,11 +1582,10 @@ def _self_test(tmp):
                         "B,2026-03-01 02:00:00\nD,2026-03-01 04:30:00\n",
                         "KEY,STAMP\nA,2026-03-01 01:00:00\n",
                         "2026-03-01 04:00:00", "2026-03-01 03:00:00")
-    check(code == 0 and "OUTSIDE" in out and "1900-01-01" in out
-          and "VERDICT: no skipped row found above the old watermark."
-          in out and "no freeze" not in out,
-          "a row skipped by an earlier run is shown as a note, and the "
-          "verdict says what it judged  <-- pinned defect")
+    check(code == 1 and "OUTSIDE" in out and "1900-01-01" in out
+          and "VERDICT: 1 finding(s)" in out and "SAFE  " not in out,
+          "a row skipped by an earlier run makes the run exit 1, not a "
+          "clean verdict  <-- pinned defect")
     code, out, err = sm("KEY,STAMP\nA,2026-03-01 01:00:00\n"
                         "B,2026-03-01 02:00:00\n",
                         "KEY,STAMP\nA,3/1/2026 1:10:00 AM\n"
@@ -1726,14 +1748,33 @@ def _self_test(tmp):
         k.arg == "allow_abbrev" and k.value.value is False
         for k in parsers[0].keywords),
           "the one parser sets allow_abbrev=False")
+    inside_test = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == "_self_test":
+            inside_test.update(id(n) for n in ast.walk(node))
+
+    def write_mode(call):
+        modes = list(call.args[1:2]) + [k.value for k in call.keywords
+                                        if k.arg == "mode"]
+        return any(not (isinstance(m, ast.Constant)
+                        and isinstance(m.value, str))
+                   or set(m.value) & set("wxa+") for m in modes)
+
     writers = [n for n in ast.walk(tree) if isinstance(n, ast.Call)
-               and getattr(n.func, "id", "") == "open"
-               and any(isinstance(a, ast.Constant) and a.value in ("w", "x")
-                       for a in n.args[1:2])]
-    check(len(writers) == 2
-          and sorted(w.args[1].value for w in writers) == ["w", "x"],
-          "the module opens a file for writing in exactly two places: the "
-          "report writer (exclusive) and this self-test")
+               and id(n) not in inside_test
+               and (getattr(n.func, "id", "") == "open" and write_mode(n)
+                    or getattr(n.func, "attr", "") in ("write_text",
+                                                       "write_bytes"))]
+    check(len(writers) == 1 and writers[0].args[1].value == "x",
+          "outside the self-test the module opens a file for writing in "
+          "exactly one place, the exclusive report writer  <-- pinned "
+          "defect")
+    check(write_mode(ast.parse("open(p, mode='ab')", mode="eval").body)
+          and write_mode(ast.parse("open(p, 'w+')", mode="eval").body)
+          and write_mode(ast.parse("open(p, m)", mode="eval").body)
+          and not write_mode(ast.parse("open(p, 'rb')", mode="eval").body),
+          "the write detector sees ab, w+ and a mode it cannot read, and "
+          "not rb")
 
     # ---- the harness itself. A check() that cannot record a failure would
     # report every defect above as a pass, which is the one failure no other

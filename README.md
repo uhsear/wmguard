@@ -40,7 +40,7 @@ PASS  an unapplied row inside the window is STRANDED  <-- pinned defect
 ...
 PASS  an unapplied row above the new mark (PENDING) also caps the safe mark: it never rises past a row the next run still needs  <-- pinned defect
 ...
-PASS  an unapplied row at or below the old mark is reported as a note, not hidden behind a clean verdict  <-- pinned defect
+PASS  an unapplied row at or below the old mark is a finding, not a clean exit 0 over a row the tool could not judge  <-- pinned defect
 ...
 PASS  a mark past every source stamp is AHEAD even when nothing is stranded, and it exits 1  <-- pinned defect
 ...
@@ -63,10 +63,10 @@ PASS  --ap, a prefix of a write flag, is refused and writes nothing  <-- pinned 
 PASS  the module imports no network library, so it has no connection to leak a credential from  <-- pinned defect
 ...
 --------------------------------------------------------------------
-200 assertions, 0 failed
+203 assertions, 0 failed
 ```
 
-The full run prints all 200 assertions. Each `...` line above is where this block is cut.
+The full run prints all 203 assertions. Each `...` line above is where this block is cut.
 
 ## What already exists
 
@@ -106,10 +106,10 @@ day.
 
 Python 3.9 or newer and nothing else. No `arcpy`, no third-party package, no network, no database.
 
-The self-test prints the same 200 assertions on Windows (Python 3.13.2, 3.12.10 and 3.10.20),
+The self-test prints the same 203 assertions on Windows (Python 3.13.2, 3.12.10 and 3.10.20),
 on Python 3.9.25 and on Ubuntu (Python 3.12.3). The outputs are identical line for line, once the
 carriage returns that Windows adds are removed. `coverage run --branch wmguard.py --self-test`
-reports 100 percent of lines and branches (860 statements, 146 branches).
+reports 100 percent of lines and branches (872 statements, 150 branches).
 
 ```
 git clone https://github.com/uhsear/wmguard.git
@@ -280,14 +280,14 @@ window: stamp after 2026-03-01 00:00:00, new watermark 2026-03-01 06:00:00
 APPLIED 3, STRANDED 2, PENDING 1, BEHIND 1, UNDATED 1
 STRANDED  the new watermark skips 2 unapplied row(s). A job that selects stamp > watermark never sees them again. A safe mark is 2026-03-01 01:10:00.
 UNDATED   1 source row(s) have a blank key or a stamp the tool cannot read, so they are not judged. A NULL stamp is never greater than a mark, and a stamp in another format is not read.
-OUTSIDE   1 unapplied row(s) have a stamp at or below the old watermark, so this run does not judge them. An earlier run may have skipped them. Pass an early --old-watermark, such as 1900-01-01, to judge the whole history.
+OUTSIDE   1 unapplied row(s) have a stamp at or below the old watermark, so this run does not judge them. An earlier run may have skipped them, or they were never meant to be applied, and the tool cannot tell which. Pass an early --old-watermark, such as 1900-01-01, to judge the whole history.
 STRANDED rows:
   row 2  key P-102  stamp 2026-03-01 01:40:00
   row 4  key P-104  stamp 2026-03-01 02:05:00
 UNDATED rows:
   row 7  key P-107  stamp none
 safe watermark: 2026-03-01 01:10:00
-VERDICT: 2 finding(s). Do not trust this watermark.
+VERDICT: 3 finding(s). Do not trust this watermark.
 exit 1
 ```
 
@@ -302,10 +302,12 @@ Five things in that run need a second look.
 - `P-107` has no stamp. Comparing NULL with the mark gives UNKNOWN, so `stamp > mark` can never
   select it, whatever the mark is. That is a finding of its own.
 - `P-090` is `BEHIND`. It is older than the old mark and is not part of this sync. It is not in
-  the applied file either, so the `OUTSIDE` note counts it. The tool cannot tell a row that an
-  earlier run skipped from a row that was never meant to be applied.
-- The verdict says "no skipped row found above the old watermark" when it finds nothing. It does
-  not claim to have judged rows below the old mark.
+  the applied file either, so the `OUTSIDE` finding counts it and the run exits 1. The tool cannot
+  tell a row that an earlier run skipped from a row that was never meant to be applied, so it does
+  not report a clean run over it.
+- The verdict says "no skipped row found above the old watermark" only when it finds nothing at
+  all, and no unapplied row sits below the old mark. It does not claim to have judged rows below
+  the old mark.
 
 To judge the whole history, pass an early `--old-watermark`. `P-090` is then in the window and the
 run finds it:
@@ -334,16 +336,18 @@ wmguard safemark: source.csv 8 row(s), applied.csv 3 row(s)
 window: stamp after 2026-03-01 00:00:00, new watermark 2026-03-01 01:10:00
 APPLIED 3, STRANDED 0, PENDING 3, BEHIND 1, UNDATED 1
 UNDATED   1 source row(s) have a blank key or a stamp the tool cannot read, so they are not judged. A NULL stamp is never greater than a mark, and a stamp in another format is not read.
-OUTSIDE   1 unapplied row(s) have a stamp at or below the old watermark, so this run does not judge them. An earlier run may have skipped them. Pass an early --old-watermark, such as 1900-01-01, to judge the whole history.
+OUTSIDE   1 unapplied row(s) have a stamp at or below the old watermark, so this run does not judge them. An earlier run may have skipped them, or they were never meant to be applied, and the tool cannot tell which. Pass an early --old-watermark, such as 1900-01-01, to judge the whole history.
 UNDATED rows:
   row 7  key P-107  stamp none
 safe watermark: 2026-03-01 01:10:00
-VERDICT: 1 finding(s). Do not trust this watermark.
+VERDICT: 2 finding(s). Do not trust this watermark.
 exit 1
 ```
 
 The stranded rows are gone. `P-102` and `P-104` are now `PENDING`, so the next run selects them.
-The `UNDATED` finding stays, because no mark fixes a row with no stamp.
+The `UNDATED` finding stays, because no mark fixes a row with no stamp. The `OUTSIDE` finding
+stays too, because `P-090` is still below the old mark and still not applied. Either apply it, or
+accept the loss and give the next run an old mark above it.
 
 `--out rows.csv --apply` writes one line per source row. Without `--apply`, the same run prints
 "Check only" and writes nothing. This is the file from the run above:
@@ -368,8 +372,8 @@ Other findings of this mode:
 | `UNDATED` | yes, exit 1 | At least one source row has a blank key or a stamp the tool cannot read. |
 | `AHEAD` | yes, exit 1 | The new mark is past the newest source stamp. This fires when no row is stranded. A mark set to the wall clock, and not to a data value, does this. |
 | `REGRESSED` | note | The new mark is behind the old one. Rows between them are selected twice and none is lost. |
-| `OUTSIDE` | note | At least one row at or below the old mark is not in the applied file. This run does not judge it. |
-| `SAFE` | note | None of the findings above, and at least one row was compared. |
+| `OUTSIDE` | yes, exit 1 | At least one row at or below the old mark is not in the applied file. This run does not judge it, and it cannot tell a skipped row from one never meant to be applied. |
+| `SAFE` | note | None of the findings or notes above, and at least one row was compared. |
 
 A row that was applied and then edited is `STRANDED` or `PENDING` at its new stamp, because the
 applied file shows the older stamp. A key that appears twice in the applied file keeps its newest
@@ -380,9 +384,13 @@ row with a blank key is counted as unreadable and left out. Without that rule, o
 row would mark every blank-key source row as applied, and the run would exit 0.
 
 A spreadsheet runs a cell that starts with `=`, `+`, `-`, `@`, a tab or a carriage return as a
-formula. OWASP lists those six characters and recommends to "Prepend each cell field with a single
-quote" ([CSV Injection](https://community.owasp.org/attacks/CSV_Injection)). The `key` column of
-`--out` comes from the source file, so `wmguard` puts one apostrophe in front of such a key.
+formula. OWASP lists those six characters, a line feed, and the full-width forms of `=`, `+`, `-`
+and `@`, and recommends to "Prepend each cell field with a single quote"
+([CSV Injection](https://community.owasp.org/attacks/CSV_Injection)). The `key` column of
+`--out` comes from the source file, so `wmguard` puts one apostrophe in front of a key that starts
+with one of the six. It does not guard the line feed or the full-width forms (see Limits). OWASP
+also warns that these techniques "are not reliable in Microsoft Excel after saving and
+re-opening the CSV file", so this is a guard and not a proof.
 `=HYPERLINK("http://x.invalid","y")` is written as `'=HYPERLINK(...)`. Row numbers stay numbers.
 The reader removes the apostrophe again, so `--out` can be the `--applied` file of a later run
 (`--applied-key-field key --applied-stamp-field stamp`). The self-test runs that round trip with
@@ -422,7 +430,7 @@ stamp blank, would otherwise report a clean run. A scheduled job reads 0 as "saf
   Subtract one tick of your column (3 ms for `datetime`) from `--new-watermark` for such a job.
 - **A `safemark` run judges only rows above `--old-watermark`.** To audit all history, pass an
   early `--old-watermark`, such as `1900-01-01`. Rows at or below the old mark are not judged, and
-  the `OUTSIDE` note only counts the ones that are missing from the applied file.
+  the `OUTSIDE` finding only counts the ones that are missing from the applied file.
 - **Stamps are timestamps only.** A watermark that is an integer or a row version is not read. A
   stamp must have no time zone and at most six fractional digits. A `datetime2(7)` value with seven
   digits is refused and not rounded, so trim it in the query. SQL Server `datetime` is "rounded to
@@ -469,9 +477,31 @@ stamp blank, would otherwise report a clean run. A scheduled job reads 0 as "saf
   written as an apostrophe followed by one of those characters, such as `'=x`, is therefore read
   as `=x` and written as `'=x`. That is the one key the file does not copy byte for byte. Keys are
   trimmed before they are written, so a tab or CR at the start of a key never reaches the guard
-  through the CLI. The guard still covers both, and the self-test calls it with both. The other
+  through the CLI. The guard still covers both, and the self-test calls it with both. Two source
+  keys that differ only by that apostrophe, such as `=x` and `'=x`, are read as one key and share
+  one verdict. The other
   three columns are not guarded: the row number is an integer, the stamp comes from a parsed
   timestamp, and the class is one of five fixed words. Stdout is not a CSV and is not guarded.
+- **Some lead characters are not guarded.** A line feed is trimmed away before it can reach the
+  guard. The full-width forms of `=`, `+`, `-` and `@` are written as they are. A zero-width space or
+  a byte-order mark in front of `=` hides the formula character from the guard, so that key is
+  written unguarded. A leading no-break space is removed by the trim, so that key is guarded and
+  written without the space, and not byte for byte.
+- **A safemark run can judge nothing above the old mark and still print `SAFE`.** If every source
+  row is at or below `--old-watermark`, and the new mark is not past the newest stamp, the window
+  is empty and the run exits 0. The window line is the only sign. Pass an early `--old-watermark` to
+  audit history.
+- **An applied file that carries a load time can look applied.** If every applied stamp is later
+  than the source stamp, every row is `APPLIED` and the run exits 0. The tool cannot tell a load
+  time from a copied source stamp. The rule above, that the applied file carries the source stamp,
+  covers the other direction, where every row looks unapplied.
+- **The safe mark cannot account for a row with an unreadable stamp.** Such a row has no place on
+  the time line, so the printed safe mark ignores it. The `UNDATED` finding still exits 1. A
+  blank-key row above the old mark does hold the safe mark below its own stamp.
+- **Keys and paths are printed as they are.** A key can hold a terminal escape sequence. The
+  traceback printed on exit 70 names the full path of the script and the files given on the command
+  line.
+- **The GitHub search above cannot be repeated from this repository.** It is a dated claim.
 - **`--out` is written in place,** not through a temporary file. A failed write can leave a partial
   file, and the exit code is 2. The verdict is printed above the error.
 - **Do not close the pipe early.** A closed stdout, as in `| head`, ends the run with exit 70 and
@@ -517,9 +547,11 @@ stamp blank, would otherwise report a clean run. A scheduled job reads 0 as "saf
   not qualify is my reading of the page.
 - Microsoft, [datetime (Transact-SQL)](https://learn.microsoft.com/en-us/sql/t-sql/data-types/datetime-transact-sql):
   accuracy "Rounded to increments of .000, .003, or .007 seconds", and time zone offset aware: "No".
-- OWASP, [CSV Injection](https://community.owasp.org/attacks/CSV_Injection): the six characters
-  that start a dangerous cell, and the recommendation to prepend a single quote. The tool does not
-  open a spreadsheet, so the effect of the apostrophe in Excel was not run here.
+- OWASP, [CSV Injection](https://community.owasp.org/attacks/CSV_Injection): the characters that
+  start a dangerous cell (`=`, `+`, `-`, `@`, tab, carriage return, line feed, and the full-width
+  forms of `=`, `+`, `-` and `@`), the recommendation to prepend a single quote, and the note that
+  Excel "may remove quotes or escape characters from CSV cells when a file is saved and re-opened".
+  The tool does not open a spreadsheet, so the effect of the apostrophe in Excel was not run here.
 - dlt, [lag](https://dlthub.com/docs/general-usage/incremental/lag) and
   [cursor](https://dlthub.com/docs/general-usage/incremental/cursor): the `lag` and
   `on_cursor_value_missing` settings described above.
