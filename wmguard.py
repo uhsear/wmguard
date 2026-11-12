@@ -6,7 +6,8 @@ it. Two things break that, and neither raises an error.
 
 frozenmark: the mark is read from MAX(stamp) of a table that stopped moving. On a
 traditionally versioned table the base table changes only when a compress moves
-the delta rows into it, so a blocked compress freezes MAX(stamp) while the _evw
+the delta rows into it (an inference from the Esri pages cited in the README,
+not run), so a blocked compress freezes MAX(stamp) while the _evw
 view keeps growing. The mark freezes with it, the job selects nothing, and "zero
 pending" is true of a table that has stopped telling the truth. A base MAX that
 lags its view by a little is normal between compresses, so the tool flags
@@ -19,6 +20,7 @@ good, and a row with no stamp was never selectable at all.
     python wmguard.py --self-test
     python wmguard.py frozenmark --watermark "2026-01-05 00:00:00" --base-max "2026-01-05 00:00:00" --view-max "2026-03-01 08:30:00"
     python wmguard.py frozenmark --watermark W --base-max B --now N --max-age-hours 48
+    python wmguard.py frozenmark --watermark W --base-max B --view-max V --job-reads view
     python wmguard.py safemark --source source.csv --applied applied.csv --old-watermark W --new-watermark W2
     python wmguard.py safemark --source s.csv --applied a.csv --old-watermark W --new-watermark W2 --out rows.csv --apply
 
@@ -92,7 +94,8 @@ SourceRow = collections.namedtuple("SourceRow", "number key stamp")
 
 # The flags that belong to one mode. A flag given to the other mode is refused,
 # because a run must not look defended by a flag it never read.
-FROZEN_ONLY = ("watermark", "base_max", "view_max", "now", "max_age_hours")
+FROZEN_ONLY = ("watermark", "base_max", "view_max", "now", "max_age_hours",
+               "job_reads")
 SAFE_ONLY = ("source", "applied", "old_watermark", "new_watermark",
              "key_field", "stamp_field", "applied_key_field",
              "applied_stamp_field", "sample", "out", "apply")
@@ -123,12 +126,15 @@ def hours(delta):
     return delta.total_seconds() / 3600.0
 
 
-def judge_frozen(watermark, base_max, view_max, now, max_age):
+def judge_frozen(watermark, base_max, view_max, now, max_age, reads=None):
     """Findings for a watermark read from a table whose MAX may be frozen.
 
     base_max is MAX(stamp) of the table the job reads. view_max is the same
     MAX read through the current-state view, or None when it was not given.
-    max_age is a timedelta. Pure: no clock, no I/O.
+    max_age is a timedelta. reads is "view", "base" or None: the table the
+    job selects from. The tool cannot see that, and a stale base MAX with the
+    mark above it means opposite things for the two readers. Pure: no clock,
+    no I/O.
 
     A watermark, base MAX or view MAX more than FUTURE_TOLERANCE_HOURS after
     now is FUTURE, a finding: age cannot show a poisoned mark, because a stamp
@@ -138,7 +144,10 @@ def judge_frozen(watermark, base_max, view_max, now, max_age):
     table lags its view between compresses, so FROZEN needs three things at
     once: the view is ahead, the base MAX is older than max_age, and the mark
     sits at or behind the base MAX. A mark above the base MAX did not come
-    from the base table, so a job that reads the view is not flagged.
+    from the base table. Only reads tells the tool whether the job selects
+    from the view (a note) or from the base (FROZEN); with reads None it is
+    the finding READER, because the tool cannot see which table the job
+    reads.
     """
     out = []
     stale = now - base_max > max_age
@@ -159,13 +168,35 @@ def judge_frozen(watermark, base_max, view_max, now, max_age):
                 "%s, and the base MAX is %.1f h old, over the limit of "
                 "%.1f h. %s." % (ahead, hours(now - base_max),
                                  hours(max_age), how)))
-        elif stale:
+        elif stale and reads == "view":
             out.append(Finding(
                 "BASE_LAGS", False,
                 "%s, and the base MAX is %.1f h old. The watermark is above "
-                "the base MAX, so it did not come from the base table. "
-                "Anything else that reads the base table is stale."
+                "the base MAX, so it did not come from the base table, and "
+                "--job-reads says the job reads the view. Anything else that "
+                "reads the base table is stale."
                 % (ahead, hours(now - base_max))))
+        elif stale and reads == "base":
+            out.append(Finding(
+                "FROZEN", True,
+                "%s, and the base MAX is %.1f h old, over the limit of "
+                "%.1f h. --job-reads says the job reads the base table. The "
+                "watermark %s is above the base MAX, so the job selects "
+                "nothing, and after the next compress it skips the rows "
+                "between the base MAX and the watermark."
+                % (ahead, hours(now - base_max), hours(max_age),
+                   fmt_stamp(watermark))))
+        elif stale:
+            out.append(Finding(
+                "READER", True,
+                "%s, and the base MAX is %.1f h old, over the limit of "
+                "%.1f h. The watermark is above the base MAX. A job that "
+                "reads the view is fine, and a job that reads the base "
+                "table selects nothing and skips rows after the next "
+                "compress. The tool cannot see which table the job reads, "
+                "so it does not call this clean. Pass --job-reads view or "
+                "--job-reads base." % (ahead, hours(now - base_max),
+                                       hours(max_age))))
         else:
             out.append(Finding(
                 "BASE_LAGS", False,
@@ -206,10 +237,14 @@ def judge_frozen(watermark, base_max, view_max, now, max_age):
                 "this fresh." % (name, fmt_stamp(stamp), hours(stamp - now),
                                  fmt_stamp(now), FUTURE_TOLERANCE_HOURS)))
     if not out:
+        note = ("" if view_max is not None else
+                " Without --view-max a table that froze less than that long "
+                "ago looks the same, so the tool could not look for a "
+                "freeze.")
         out.append(Finding(
             "FRESH", False,
             "the base MAX is within %.1f h of now and the watermark is not "
-            "past it." % hours(max_age)))
+            "past it.%s" % (hours(max_age), note)))
     return out
 
 
@@ -359,6 +394,18 @@ class SafeReport(object):
                         "tool cannot read, or the source has no row.")
 
 
+def later_keys(rows, verdicts, applied):
+    """Count of keys with an APPLIED row whose applied stamp is later than
+    every source stamp of that key. Equal is the normal case."""
+    newest = {}
+    for r in rows:
+        if r.stamp is not None and (r.key not in newest
+                                    or r.stamp > newest[r.key]):
+            newest[r.key] = r.stamp
+    return len(set(r.key for r, v in zip(rows, verdicts)
+                   if v == APPLIED and applied[r.key] > newest[r.key]))
+
+
 def judge_safe(rows, applied, unreadable, old, new):
     """Judge the move of a watermark from old to new. Pure: no clock, no I/O.
 
@@ -407,6 +454,16 @@ def judge_safe(rows, applied, unreadable, old, new):
             "have skipped them, or they were never meant to be applied, and "
             "the tool cannot tell which. Pass an early --old-watermark, such "
             "as 1900-01-01, to judge the whole history." % outside))
+    later = later_keys(rows, verdicts, applied)
+    if later:
+        findings.append(Finding(
+            "LATER", True,
+            "%d key(s) read APPLIED only because the applied stamp is later "
+            "than every source stamp of that key. A load time, or a stamp "
+            "in another time zone, looks like this, and so does an applied "
+            "file exported after a newer edit. The tool cannot tell, and an "
+            "older copy of the row may be the one that was applied. Export "
+            "the applied stamp as the source stamp." % later))
     compared = len(verdicts) - undated - verdicts.count(BEHIND)
     if not findings and compared:
         findings.append(Finding(
@@ -440,11 +497,14 @@ def verdict_line(findings, why, clean):
 
 
 CLEAN_FROZEN = "VERDICT: no frozen MAX and no mark past the source found."
+CLEAN_FROZEN_NO_VIEW = ("VERDICT: the base MAX is inside the age limit and "
+                        "the mark is not past it. No --view-max was given, so "
+                        "a freeze younger than the limit was not looked for.")
 CLEAN_SAFE = "VERDICT: no skipped row found above the old watermark."
 
 
-def describe_frozen(watermark, base_max, view_max, now, max_age):
-    findings = judge_frozen(watermark, base_max, view_max, now, max_age)
+def describe_frozen(watermark, base_max, view_max, now, max_age, reads=None):
+    findings = judge_frozen(watermark, base_max, view_max, now, max_age, reads)
     lines = ["wmguard frozenmark: watermark %s, base MAX %s, view MAX %s, now "
              "%s, limit %.1f h"
              % (fmt_stamp(watermark), fmt_stamp(base_max),
@@ -452,7 +512,9 @@ def describe_frozen(watermark, base_max, view_max, now, max_age):
                 fmt_stamp(now), hours(max_age))]
     for f in findings:
         lines.append("%-9s %s" % (f.code, f.message))
-    lines.append(verdict_line(findings, None, CLEAN_FROZEN))
+    lines.append(verdict_line(
+        findings, None, CLEAN_FROZEN if view_max is not None
+        else CLEAN_FROZEN_NO_VIEW))
     return lines, gate(findings, 1)
 
 
@@ -572,6 +634,9 @@ def _parse(argv):
                     help="frozenmark: MAX(stamp) of the table the job reads")
     ap.add_argument("--view-max", dest="view_max",
                     help="frozenmark: MAX(stamp) through the _evw view")
+    ap.add_argument("--job-reads", dest="job_reads", choices=("view", "base"),
+                    help="frozenmark: the table the job selects from. Needed "
+                         "to judge a mark above a stale base MAX.")
     ap.add_argument("--now", help="frozenmark: the time to measure age from "
                                   "(default: this machine's clock)")
     ap.add_argument("--max-age-hours", dest="max_age_hours", type=float,
@@ -725,7 +790,8 @@ def _run_frozen(args):
         raise ValueError("--max-age-hours must be between 0 and %d."
                          % MAX_AGE_LIMIT_HOURS)
     lines, code = describe_frozen(watermark, base_max, view_max, now,
-                                  datetime.timedelta(hours=limit))
+                                  datetime.timedelta(hours=limit),
+                                  args.job_reads)
     for line in lines:
         print(line)
     return code
@@ -845,10 +911,10 @@ def _self_test(tmp):
     def codes(findings):
         return [f.code for f in findings]
 
-    def frozen(watermark, base, view, now, age_hours=48.0):
+    def frozen(watermark, base, view, now, age_hours=48.0, reads=None):
         return judge_frozen(T(watermark), T(base), None if view is None
                             else T(view), T(now),
-                            datetime.timedelta(hours=age_hours))
+                            datetime.timedelta(hours=age_hours), reads)
 
     print("wmguard self-test: temporary files only, no network, no "
           "credentials")
@@ -906,16 +972,35 @@ def _self_test(tmp):
           "and its wording names only the part of the gap the base cannot "
           "hold, not the rows the job still reads")
     f = frozen("2026-02-01 00:00:00", "2026-01-05 00:00:00",
-               "2026-03-01 08:30:00", "2026-03-01 09:00:00")
+               "2026-03-01 08:30:00", "2026-03-01 09:00:00", reads="view")
     check(codes(f) == ["BASE_LAGS"] and not f[0].is_finding
           and "did not come from the base table" in f[0].message,
-          "a watermark above a stale base MAX did not come from the base: a "
-          "note, not a finding  <-- pinned defect")
+          "a watermark above a stale base MAX, for a job that reads the "
+          "view, did not come from the base: a note, not a finding  "
+          "<-- pinned defect")
     f = frozen("2026-03-01 02:00:00", "2026-02-20 00:00:00",
-               "2026-03-01 08:30:00", "2026-03-01 09:00:00")
+               "2026-03-01 08:30:00", "2026-03-01 09:00:00", reads="view")
     check(codes(f) == ["BASE_LAGS"] and not f[0].is_finding,
           "a job that reads the view, whose mark trails the view MAX, is not "
           "FROZEN  <-- pinned defect")
+    f = frozen("2026-03-01 08:20:00", "2026-01-05 00:00:00",
+               "2026-03-01 08:30:00", "2026-03-01 09:00:00")
+    check(codes(f) == ["READER"] and f[0].is_finding
+          and gate(f, 1) == 1 and "--job-reads" in f[0].message,
+          "a mark above a stale base MAX, with no --job-reads, is a finding: "
+          "a base reader selects nothing and the tool cannot see which table "
+          "the job reads  <-- pinned defect")
+    f = frozen("2026-03-01 08:20:00", "2026-01-05 00:00:00",
+               "2026-03-01 08:30:00", "2026-03-01 09:00:00", reads="base")
+    check(codes(f) == ["FROZEN"] and f[0].is_finding
+          and "selects nothing" in f[0].message
+          and "--job-reads says the job reads the base" in f[0].message,
+          "and for a job that reads the base table it is FROZEN  "
+          "<-- pinned defect")
+    f = frozen("2026-01-04 00:00:00", "2026-01-05 00:00:00",
+               "2026-03-01 08:30:00", "2026-03-01 09:00:00", reads="view")
+    check(codes(f) == ["FROZEN"],
+          "--job-reads view does not hide a mark behind a frozen base MAX")
     f = frozen("2026-03-01 08:00:00", "2026-03-01 08:00:00",
                "2026-03-01 08:20:00", "2026-03-01 08:30:00")
     check(codes(f) == ["BASE_LAGS"] and not f[0].is_finding
@@ -938,10 +1023,10 @@ def _self_test(tmp):
                "2026-03-01 00:05:00", "2026-03-03 00:00:01")
     check(codes(f) == ["FROZEN"], "and one second over it is FROZEN")
     f = frozen("2026-03-01 08:30:00", "2026-01-05 00:00:00",
-               "2026-03-01 08:30:00", "2026-03-01 09:00:00")
+               "2026-03-01 08:30:00", "2026-03-01 09:00:00", reads="view")
     check(codes(f) == ["BASE_LAGS"] and not f[0].is_finding,
-          "a watermark taken from the view is fine though the base lags: a "
-          "note, not a finding")
+          "a watermark taken from the view is fine though the base lags, for "
+          "a job that reads the view: a note, not a finding")
     check("stale" in f[0].message,
           "and the note says other readers of the base are stale")
     f = frozen("2026-03-01 08:30:00", "2026-03-01 08:30:00",
@@ -959,6 +1044,10 @@ def _self_test(tmp):
     f = frozen("2026-03-01 08:30:00", "2026-03-01 08:30:00", None,
                "2026-03-01 09:00:00")
     check(codes(f) == ["FRESH"], "a recent base MAX with no view is FRESH")
+    check("a table that froze less than that long ago looks the same"
+          in f[0].message,
+          "and the note says a young freeze was not looked for  "
+          "<-- pinned defect")
     f = frozen("2026-03-01 00:00:00", "2026-03-01 00:00:00", None,
                "2026-03-03 00:00:00")
     check(codes(f) == ["FRESH"],
@@ -1152,6 +1241,27 @@ def _self_test(tmp):
           "a mark moved backwards is a note: rows are selected twice, none "
           "lost")
     check(gate(r.findings, r.compared) == 0, "a regression alone exits 0")
+    r = judge([("C", "2026-03-01 02:30:00"), ("E", "2026-03-01 03:30:00")],
+              {"C": T("2026-03-01 06:00:00"), "E": T("2026-03-01 03:30:00")},
+              n=T("2026-03-01 03:00:00"))
+    check(codes(r.findings) == ["LATER"] and r.findings[0].is_finding
+          and gate(r.findings, r.compared) == 1
+          and "1 key(s)" in r.findings[0].message,
+          "an applied stamp 3.5 h after the only source stamp of its key "
+          "(a time zone or a load time) is LATER, not SAFE  <-- pinned "
+          "defect")
+    r = judge([("C", "2026-03-01 02:30:00"), ("C", "2026-03-01 04:30:00")],
+              {"C": T("2026-03-01 04:30:00")}, n=T("2026-03-01 04:30:00"))
+    check(codes(r.findings) == ["SAFE"],
+          "an older source row of a key whose newest row was applied is not "
+          "LATER")
+    r = judge([("C", None), ("D", "2026-03-01 02:30:00"),
+               ("E", "2026-02-28 01:00:00")],
+              {"C": T("2026-03-01 06:00:00"), "D": T("2026-03-01 02:30:00"),
+               "E": T("2026-03-01 06:00:00")}, n=T("2026-03-01 03:00:00"))
+    check("LATER" not in codes(r.findings),
+          "a key with no readable source stamp, and a key below the old "
+          "mark, are not judged LATER")
     r = judge([("A", "2026-03-01 05:00:00")],
               {"A": T("2026-03-01 05:00:00")},
               o=T("2026-03-01 04:00:00"), n=T("2026-03-01 04:00:00"))
@@ -1301,6 +1411,32 @@ def _self_test(tmp):
     code, out, err = run_cli(fz + ["--max-age-hours", "100000"])
     check(code == 0 and "FRESH" in out and "100000.0 h" in out,
           "a wide --max-age-hours is honoured")
+    check("a freeze younger than the limit was not looked for" in out
+          and "no frozen MAX" not in out,
+          "a clean run with no --view-max does not claim it found no frozen "
+          "MAX  <-- pinned defect")
+    young = ["frozenmark", "--watermark", "2026-03-01 08:20:00",
+             "--base-max", "2026-01-05 00:00:00", "--view-max",
+             "2026-03-01 08:30:00", "--now", "2026-03-01 09:00:00"]
+    code, out, err = run_cli(young)
+    check(code == 1 and "READER" in out and err == "",
+          "a mark above a stale base MAX with no --job-reads exits 1  "
+          "<-- pinned defect")
+    code, out, err = run_cli(young + ["--job-reads", "view"])
+    check(code == 0 and "BASE_LAGS" in out,
+          "--job-reads view makes it a note and exits 0")
+    code, out, err = run_cli(young + ["--job-reads", "base"])
+    check(code == 1 and "FROZEN" in out,
+          "--job-reads base makes it FROZEN and exits 1")
+    code, out, err = run_cli(young + ["--job-reads", "both"])
+    check(code == 64 and out == "",
+          "--job-reads accepts view or base only")
+    code, out, err = run_cli(
+        ["safemark", "--source", "s.csv", "--applied", "a.csv",
+         "--old-watermark", "2026-01-01", "--new-watermark", "2026-03-01",
+         "--job-reads", "view"])
+    check(code == 64 and "--job-reads" in err,
+          "--job-reads is refused by safemark, where nothing reads it")
     code, out, err = run_cli(
         ["frozenmark", "--watermark", "2026-01-05 00:00:00", "--base-max",
          "2026-01-05 00:00:00"])

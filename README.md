@@ -77,10 +77,10 @@ PASS  --ap, a prefix of a write flag, is refused and writes nothing  <-- pinned 
 PASS  the module imports no network library, so it has no connection to leak a credential from  <-- pinned defect
 ...
 --------------------------------------------------------------------
-226 assertions, 0 failed
+239 assertions, 0 failed
 ```
 
-The full run prints all 226 assertions. Each `...` line above is where this block is cut.
+The full run prints all 239 assertions. Each `...` line above is where this block is cut.
 
 ## What already exists
 
@@ -120,10 +120,10 @@ day.
 
 Python 3.9 or newer and nothing else. No `arcpy`, no third-party package, no network, no database.
 
-The self-test prints the same 226 assertions on Windows (Python 3.13.2 and 3.12.10)
+The self-test prints the same 239 assertions on Windows (Python 3.13.2 and 3.12.10)
 and on Ubuntu (Python 3.9.25 and 3.12.3). The outputs are identical line for line, once the
 carriage returns that Windows adds are removed. `coverage run --branch wmguard.py --self-test`
-reports 100 percent of lines and branches (969 statements, 162 branches).
+reports 100 percent of lines and branches (1010 statements, 172 branches).
 
 ```
 git clone https://github.com/uhsear/wmguard.git
@@ -135,7 +135,7 @@ Pick a mode first. Then name the numbers that mode needs.
 
 ```
 python wmguard.py --self-test
-python wmguard.py frozenmark --watermark W --base-max B --view-max V
+python wmguard.py frozenmark --watermark W --base-max B --view-max V --job-reads view
 python wmguard.py frozenmark --watermark W --base-max B --now N --max-age-hours 24
 python wmguard.py safemark --source source.csv --applied applied.csv --old-watermark W --new-watermark W2
 python wmguard.py safemark --source source.csv --applied applied.csv --old-watermark W --new-watermark W2 --out rows.csv --apply
@@ -165,6 +165,7 @@ the version the session set, and it does not move on (see Sources).
 | `--watermark` | frozenmark | The stored watermark. Required. |
 | `--base-max` | frozenmark | `MAX(stamp)` of the table the job reads. Required. |
 | `--view-max` | frozenmark | `MAX(stamp)` through the `_evw` view. Off by default. |
+| `--job-reads` | frozenmark | `view` or `base`: the table the job selects from. Needed to judge a mark above a stale base MAX (`READER` without it). |
 | `--now` | frozenmark | The time to measure age from. Default: this machine's clock. |
 | `--max-age-hours` | frozenmark | A base MAX older than this is stale. Default `48`. `0` to `1000000`. |
 | `--source` | safemark | CSV of the source rows. Required. |
@@ -233,7 +234,34 @@ VERDICT: 2 finding(s). Do not trust this watermark.
 exit 1
 ```
 
-The five runs show the cases that matter. The first run has a view that is 1328.5 hours ahead of
+Three more runs show the reader question. A mark above a frozen base MAX means opposite things
+for the two kinds of job, and the tool cannot see which table the job reads. With no `--job-reads`
+it says so and exits 1. The same numbers, with the answer given:
+
+```
+$ python wmguard.py frozenmark --watermark "2026-03-01 08:20:00" --base-max "2026-01-05 00:00:00" --view-max "2026-03-01 08:30:00" --now "2026-03-01 09:00:00"
+wmguard frozenmark: watermark 2026-03-01 08:20:00, base MAX 2026-01-05 00:00:00, view MAX 2026-03-01 08:30:00, now 2026-03-01 09:00:00, limit 48.0 h
+READER    the view MAX 2026-03-01 08:30:00 is 1328.5 h ahead of the base MAX 2026-01-05 00:00:00, and the base MAX is 1329.0 h old, over the limit of 48.0 h. The watermark is above the base MAX. A job that reads the view is fine, and a job that reads the base table selects nothing and skips rows after the next compress. The tool cannot see which table the job reads, so it does not call this clean. Pass --job-reads view or --job-reads base.
+VERDICT: 1 finding(s). Do not trust this watermark.
+exit 1
+```
+
+With `--job-reads view` the same numbers print a `BASE_LAGS` note and exit 0. With
+`--job-reads base` they print `FROZEN`, because a job that reads the base table selects nothing
+above a mark that sits above the base MAX, and exit 1.
+
+When no `--view-max` is given and the base MAX is inside the age limit, the tool cannot look for
+a freeze that began less than that long ago. It exits 0 and says what it did not do:
+
+```
+$ python wmguard.py frozenmark --watermark "2026-03-01 00:00:00" --base-max "2026-03-01 00:00:00" --now "2026-03-01 20:00:00"
+wmguard frozenmark: watermark 2026-03-01 00:00:00, base MAX 2026-03-01 00:00:00, view MAX not given, now 2026-03-01 20:00:00, limit 48.0 h
+FRESH     the base MAX is within 48.0 h of now and the watermark is not past it. Without --view-max a table that froze less than that long ago looks the same, so the tool could not look for a freeze.
+VERDICT: the base MAX is inside the age limit and the mark is not past it. No --view-max was given, so a freeze younger than the limit was not looked for.
+exit 0
+```
+
+The five runs above show the cases that matter. The first run has a view that is 1328.5 hours ahead of
 the base, a base MAX over the age limit, and a mark equal to the base. The second run has an old
 base that the view does not pass, so the table is quiet and not frozen. The third run has no view.
 An old base MAX then looks the same whether the table is frozen or idle, so the tool says that and
@@ -245,19 +273,21 @@ stamp in the future is never old. The tool compares each stamp with `--now` and 
 
 | Code | Finding? | When |
 |---|---|---|
-| `FROZEN` | yes, exit 1 | The view MAX is ahead of the base MAX, the base MAX is older than `--max-age-hours`, and the mark is at or behind the base MAX. |
+| `FROZEN` | yes, exit 1 | The view MAX is ahead of the base MAX, the base MAX is older than `--max-age-hours`, and the mark is at or behind the base MAX. Also when the mark is above the base MAX and `--job-reads base` says the job reads the base table. |
+| `READER` | yes, exit 1 | The view MAX is ahead, the base MAX is older than the limit, the mark is above the base MAX, and `--job-reads` was not given. The tool cannot see which table the job reads. |
 | `STALE` | yes, exit 1 | No view was given, and the base MAX is older than `--max-age-hours`. |
 | `FUTURE` | yes, exit 1 | The mark, the base MAX or the view MAX is more than 12 hours after `--now`. The tolerance is `FUTURE_TOLERANCE_HOURS` in the file; it allows for a database clock in another zone. One finding per stamp. |
 | `AHEAD` | yes, exit 1 | The mark is past every stamp the source has. A row stamped at or below it that arrives later is never selected. |
-| `BASE_LAGS` | note | The view MAX is ahead of the base MAX, but the base MAX is within the age limit, or the mark is above the base MAX so it did not come from the base table. |
+| `BASE_LAGS` | note | The view MAX is ahead of the base MAX, but the base MAX is within the age limit, or the mark is above a stale base MAX and `--job-reads view` says the job reads the view. |
 | `IDLE` | note | The base MAX is old, but the view is not ahead of it. The table is quiet. |
-| `FRESH` | note | The base MAX is recent, no stamp is in the future of `--now`, and the mark is not past the source. |
+| `FRESH` | note | The base MAX is recent, no stamp is in the future of `--now`, and the mark is not past the source. Without `--view-max` it also says a freeze younger than the limit was not looked for. |
 
 `FROZEN` means that the base table lags its view now and has done so for longer than the limit,
 and that the mark sits where a job reading the base table would put it. One snapshot cannot show
 that a table stopped moving. A blocked compress that is younger than `--max-age-hours` shows up as
 `BASE_LAGS` until it ages past the limit. A job that reads the view keeps a mark above the base
-MAX, so it is not flagged.
+MAX, so `--job-reads view` keeps it from being flagged. Without `--job-reads`, that mark is
+`READER`, a finding, because a job that reads the base table selects nothing above it.
 
 The age limit is inclusive. A base MAX exactly at the limit is not stale, and one second over is.
 A stamp more than 12 hours after `--now` is `FUTURE`, a finding, and never `FRESH`. A stamp up to 12 hours after `--now` (the limit is inclusive) is treated as zone skew. A view MAX behind the base MAX is not freeze
@@ -277,6 +307,33 @@ above `--old-watermark`.
 | `PENDING` | The row is unapplied, and its stamp is above the new mark. The next run still selects it. |
 | `BEHIND` | The stamp is at or below the old mark. The row is outside this sync. It may be applied or not. |
 | `UNDATED` | The stamp is blank or in a format the tool does not read, or the row is above the old mark and has a blank key. It is not judged. |
+
+A key whose applied stamp is later than every source stamp of that key is `LATER`, a finding.
+An applied copy stored five hours late, because the serving table keeps UTC or a load time,
+would otherwise let an older, unapplied row of that key read `APPLIED`. The tool cannot tell
+that from an applied file that was exported after a newer edit, so it exits 1 for both. Synthetic
+files, one key shifted by 3.5 hours:
+
+```
+$ cat source.csv
+KEY,STAMP
+C,2026-03-01 02:30:00
+E,2026-03-01 03:30:00
+$ cat applied.csv
+KEY,STAMP
+C,2026-03-01 06:00:00
+E,2026-03-01 03:30:00
+$ python wmguard.py safemark --source source.csv --applied applied.csv --old-watermark "2026-03-01 00:00:00" --new-watermark "2026-03-01 03:00:00"
+wmguard safemark: source.csv 2 row(s), applied.csv 2 row(s)
+window: stamp after 2026-03-01 00:00:00, new watermark 2026-03-01 03:00:00
+APPLIED 2, STRANDED 0, PENDING 0, BEHIND 0, UNDATED 0
+LATER     1 key(s) read APPLIED only because the applied stamp is later than every source stamp of that key. A load time, or a stamp in another time zone, looks like this, and so does an applied file exported after a newer edit. The tool cannot tell, and an older copy of the row may be the one that was applied. Export the applied stamp as the source stamp.
+safe watermark: 2026-03-01 03:30:00
+VERDICT: 1 finding(s). Do not trust this watermark.
+exit 1
+```
+
+The safe mark on that run is not trustworthy, because it counts the shifted key as applied.
 
 The demo has eight source rows and three applied rows. Both files are synthetic.
 
@@ -330,9 +387,9 @@ Five things in that run need a second look.
   the applied file either, so the `OUTSIDE` finding counts it and the run exits 1. The tool cannot
   tell a row that an earlier run skipped from a row that was never meant to be applied, so it does
   not report a clean run over it.
-- The verdict says "no skipped row found above the old watermark" only when it finds nothing at
-  all, and no unapplied row sits below the old mark. It does not claim to have judged rows below
-  the old mark.
+- The verdict says "no skipped row found above the old watermark" only when it finds no finding,
+  and no unapplied row sits below the old mark. A note alone, such as `REGRESSED`, does not stop
+  it. It does not claim to have judged rows below the old mark.
 
 To judge the whole history, pass an early `--old-watermark`. `P-090` is then in the window and the
 run finds it:
@@ -477,8 +534,11 @@ stamp blank, or with every row at or below the old mark, would otherwise report 
   `--applied` export looks stranded or pending. Export both right after the sync, in one
   transaction if you can.
 - **The applied file must carry the source stamp.** If the serving table stores its own load time,
-  a load time later than the source stamp reads as `APPLIED`, and one earlier than the source stamp
-  reads as `STRANDED`. Copy the source stamp into the serving row when you apply it.
+  a load time earlier than the source stamp reads as `STRANDED`. A stamp later than every source
+  stamp of its key, from a load time or a shifted time zone, is the `LATER` finding. The tool
+  cannot see an offset that keeps the applied stamp at or below the newest source stamp of the
+  key, so a shift smaller than the gap between two edits of one key can still read `APPLIED`.
+  Copy the source stamp into the serving row when you apply it.
 - **A view MAX can be stale too.** A session that set a version keeps reading that version's state
   (see Sources). Take the view MAX from a session that set none.
 - **`STALE` cannot tell frozen from idle.** Without `--view-max`, a quiet table over a long
@@ -490,12 +550,16 @@ stamp blank, or with every row at or below the old mark, would otherwise report 
   that far ahead is not caught as `FUTURE`. The 12 hours is a guess, set in the file.
 - **A duplicate key in the source** is judged row by row. Each row is `APPLIED` when its key's
   newest applied stamp is the same or newer.
-- **Keys are compared as trimmed text.** `P-1` and `p-1` are two keys, and so are `7` and `07`.
+- **Keys are compared as trimmed text, case-sensitively.** `P-1` and `p-1` are two keys, and so
+  are `7` and `07`. SQL Server default collations are not case-sensitive, and a spreadsheet can
+  drop leading zeros (`00123` to `123`) or change case. The result is a false `STRANDED`, which
+  exits 1, the safe direction.
 - **Only comma-separated UTF-8 CSV is read.** UTF-16, tab-delimited and semicolon-delimited files
   exit 64. A UTF-16 file gets its own message. A tab or semicolon file gets "columns not in the
   CSV" and a count of one column, which shows the problem. A file with a byte that is not UTF-8,
   such as a Windows-1252 export with accented names, exits 2 and names the file, the byte and its
-  offset. Nothing is decoded lossily, so two keys never collapse into one. A BOM at the start of a UTF-8 file is removed. A NUL
+  offset. Nothing is decoded lossily, so a decoding step never merges two keys. Trimming and the
+  guard apostrophe can (see below). A BOM at the start of a UTF-8 file is removed. A NUL
   byte inside a file gives exit 2 on Python 3.9 and 3.10, where the csv module refuses it, and is
   read as part of the text on Python 3.11 and later. That was measured on 3.9, 3.10, 3.11 and 3.12,
   and the cause in the csv module was not checked against the Python changelog. A field over csv's default limit of 131072
@@ -553,10 +617,9 @@ stamp blank, or with every row at or below the old mark, would otherwise report 
   a `SAFE` line. A sync that really had nothing new to apply therefore exits 4 too. The tool
   cannot tell an idle sync from a wrong old mark. A scheduler should treat 4 as "check", not as
   failure of the job.
-- **An applied file that carries a load time can look applied.** If every applied stamp is later
-  than the source stamp, every row is `APPLIED` and the run exits 0. The tool cannot tell a load
-  time from a copied source stamp. The rule above, that the applied file carries the source stamp,
-  covers the other direction, where every row looks unapplied.
+- **`LATER` is a guess in the safe direction.** An applied file that was exported after a newer
+  edit of the key has an applied stamp later than the source stamp and exits 1 too. Export the
+  source after the sync, so the two files come from one moment.
 - **The safe mark cannot account for a row with an unreadable stamp.** Such a row has no place on
   the time line, so the printed safe mark ignores it. The `UNDATED` finding still exits 1. A
   blank-key row above the old mark does hold the safe mark below its own stamp.
@@ -578,13 +641,54 @@ stamp blank, or with every row at or below the old mark, would otherwise report 
 - **Ctrl+C is not handled.** An interrupt ends the run with Python's own status and a traceback,
   and not with a code from the table above. That is a stop by the operator and not a finding.
 - **Both files are read into memory.** One run of 300,000 source rows and 297,000 applied rows took
-  about 11 seconds, as a past measurement that this repository cannot repeat (10.5 to 11.6 over four runs) on a Windows workstation with Python 3.13.2. The
-  keys were `K0` to `K299999`, the stamps were 20 seconds apart, and 2,549 rows were stranded. The
-  generator of that file is not published, so the stranded count cannot be repeated. Under
-  `cProfile`, 24 of 28 seconds went to `strptime`. That is one machine, so yours will differ. A
-  table of tens of millions of rows is not what this is for.
+  about 11 seconds (10.5 to 11.6 over four runs) on a Windows workstation with Python 3.13.2.
+  The files come from this generator, which you can run:
+
+  ```python
+  import datetime
+  t0 = datetime.datetime(2026, 1, 1)
+  with open("bench-src.csv", "w", newline="") as src, \
+          open("bench-app.csv", "w", newline="") as app:
+      src.write("KEY,STAMP\r\n")
+      app.write("KEY,STAMP\r\n")
+      for i in range(300000):
+          line = "K%d,%s\r\n" % (i, (t0 + datetime.timedelta(seconds=20 * i))
+                                  .strftime("%Y-%m-%d %H:%M:%S"))
+          src.write(line)
+          if i % 100 != 7:       # every 100th row is left unapplied
+              app.write(line)
+  ```
+
+  `python wmguard.py safemark --source bench-src.csv --applied bench-app.csv --old-watermark
+  1900-01-01 --new-watermark "2026-03-01 00:00:00"` then prints `APPLIED 297000, STRANDED 2549,
+  PENDING 451` and exits 1. Under `cProfile`, 24 of 28 seconds went to `strptime`. That is one
+  machine, so yours will differ. A table of tens of millions of rows is not what this is for.
 - **The self-test reads the clock.** The assertions that omit `--now` expect `2026-01-05` to be
   stale, so they fail when the system date is before 2026-01-07.
+- **Keys that differ only by one leading guard apostrophe can give a wrong verdict.** `=x` and
+  `'=x` are read as one key. An unapplied source row `=x` therefore reads `APPLIED` when only `'=x`
+  was applied with a later stamp, and the run can exit 0. Keys of that shape are rare.
+- **No path writes a file and reads it back.** `wmguard` refuses its own `--out` file with exit 64,
+  so the strip-on-read of the guard apostrophe is pinned through `uncell(cell(v)) == v` and
+  through an applied export that a spreadsheet guarded, and not through a file written then read.
+- **Stamps without seconds and `datetime2(7)` values are `UNDATED`.** `2026-03-01 01:00` and a
+  value with seven fraction digits are not read. A file of only such stamps exits 4 with "nothing
+  was compared". The stamp tick of 3 ms for `datetime` is an approximation: it rounds to .000,
+  .003 and .007 seconds, so the spacing is not even.
+- **`IDLE` assumes every edit is stamped above the base MAX.** A clock that steps back, or a
+  back-dated bulk load, can freeze a table while the view MAX is not ahead of the base MAX. The
+  run then exits 0.
+- **Name two different files for `--source` and `--applied`.** The tool does not compare the two
+  paths. The same CSV given twice marks every row `APPLIED` and exits 0.
+- **A sentinel stamp such as `9999-12-31` on a source row is read as a real stamp.** The row stays
+  `PENDING` and `safemark` raises no `FUTURE` finding. `FUTURE` is judged only in `frozenmark`.
+- **A zero-byte `--applied` file exits 64, not a verdict.** A sync that applied nothing needs a
+  header-only applied file to get a verdict.
+- **A file that does not name itself in a csv error.** A NUL byte or a BOM-less UTF-16 file on
+  Python 3.9 and 3.10, and a field over csv's limit on every version, exit 2 with a message that
+  does not name the file.
+- **A closed pipe is blamed on the tool.** In `safemark ... | head -1`, the cause is the reader.
+  The exit 70 is accurate and the printed "fault in the tool" text misattributes it.
 - **There is no `--fix`.** The tool names a safe mark. Writing it to the watermark table is an
   edit somebody signs for.
 - **No line is unreachable.** Coverage is 100 percent of lines and branches. The self-test starts
@@ -609,7 +713,7 @@ stamp blank, or with every row at or below the old mark, would otherwise report 
   or add one, the file is read as ordinary rows, and the hidden-stranded-rows problem above returns.
 - **A mark taken from the `_evw` view needs `--view-max`.** Without it, `frozenmark` compares the
   mark with the base MAX only, and a mark that is ahead of the base table reads as `AHEAD`
-  (exit 1). Give `--view-max` for a job that reads the view.
+  (exit 1). Give `--view-max` and `--job-reads view` for a job that reads the view.
 - **Keys that begin with a minus sign,** including negative integers such as `-3`, are written to
   `--out` with a guard apostrophe. The reader removes it from `--source` and `--applied`, and a
   spreadsheet shows the apostrophe.
@@ -639,8 +743,9 @@ stamp blank, or with every row at or below the old mark, would otherwise report 
   `--source` and `--applied` only at data you accept to see in the log. A byte that is not UTF-8 is
   named with its offset in the exit 2 message, so one byte of a wrongly supplied file can reach
   stderr.
-- **A killed self-test can leave a directory** named `wmguard-selftest-*` in the temp folder. Delete
-  any that remain.
+- **The self-test writes files** under a fresh temporary directory and starts two child
+  interpreters. A finally block removes the files. **A killed self-test can leave a directory**
+  named `wmguard-selftest-*` in the temp folder. Delete any that remain.
 - **The compress-to-delta-table behaviour in the opening** is an inference from the Esri pages in
   Sources, not a quoted statement.
 - It opens no socket and imports no network module, so no credential can leak from it. The
