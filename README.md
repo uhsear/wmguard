@@ -667,7 +667,9 @@ stamp blank, or with every row at or below the old mark, would otherwise report 
   stale, so they fail when the system date is before 2026-01-07.
 - **Keys that differ only by one leading guard apostrophe can give a wrong verdict.** `=x` and
   `'=x` are read as one key. An unapplied source row `=x` therefore reads `APPLIED` when only `'=x`
-  was applied with a later stamp, and the run can exit 0. Keys of that shape are rare.
+  was applied with the same stamp, and the run can exit 0 with a `SAFE` line. If the applied stamp
+  is later than the source stamp, the `LATER` finding fires and the run exits 1. Keys of that
+  shape are rare.
 - **No path writes a file and reads it back.** `wmguard` refuses its own `--out` file with exit 64,
   so the strip-on-read of the guard apostrophe is pinned through `uncell(cell(v)) == v` and
   through an applied export that a spreadsheet guarded, and not through a file written then read.
