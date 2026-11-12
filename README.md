@@ -503,7 +503,7 @@ source row look unapplied, and a scheduled job could not tell that from a real f
 |---|---|
 | 0 | Nothing found. Notes may still print. |
 | 1 | At least one finding. |
-| 2 | A file could not be read or is not UTF-8 text, or `--out` could not be written. |
+| 2 | A file could not be read or is not UTF-8 text, or `--out` could not be written. A UTF-16 file is the exception and exits 64; see Limits. |
 | 4 | Nothing was compared: no source row could be judged (each is `BEHIND`, `UNDATED` or absent), or no applied row was readable. |
 | 64 | Usage error: a bad flag, a bad stamp, a wrong-mode flag, an empty flag value, an existing `--out`, `--source` and `--applied` naming one file, or a column the file lacks. |
 | 70 | An unexpected crash in the tool. It is never a finding about the data. |
