@@ -280,7 +280,7 @@ stamp in the future is never old. The tool compares each stamp with `--now` and 
 | `AHEAD` | yes, exit 1 | The mark is past every stamp the source has. A row stamped at or below it that arrives later is never selected. |
 | `BASE_LAGS` | note | The view MAX is ahead of the base MAX, but the base MAX is within the age limit, or the mark is above a stale base MAX and `--job-reads view` says the job reads the view. |
 | `IDLE` | note | The base MAX is old, but the view is not ahead of it. The table is quiet. |
-| `FRESH` | note | The base MAX is recent, no stamp is in the future of `--now`, and the mark is not past the source. Without `--view-max` it also says a freeze younger than the limit was not looked for. |
+| `FRESH` | note | The base MAX is recent, no stamp is more than 12 hours after `--now`, and the mark is not past the source. Without `--view-max` it also says a freeze younger than the limit was not looked for. |
 
 `FROZEN` means that the base table lags its view now and has done so for longer than the limit,
 and that the mark sits where a job reading the base table would put it. One snapshot cannot show
@@ -714,6 +714,10 @@ stamp blank, or with every row at or below the old mark, would otherwise report 
 - **A mark taken from the `_evw` view needs `--view-max`.** Without it, `frozenmark` compares the
   mark with the base MAX only, and a mark that is ahead of the base table reads as `AHEAD`
   (exit 1). Give `--view-max` and `--job-reads view` for a job that reads the view.
+- **`--job-reads` is ignored unless it is needed.** Given with a case that is not stale, or without `--view-max`, it changes nothing and prints no warning.
+- **`FROZEN` can be a conservative false alarm.** A job that reads the view, with a mark equal to a frozen base MAX while the view is ahead, is flagged with exit 1 even with `--job-reads view`, because the mark sits where a base-table reader would put it.
+- **The `frozenmark` error for a stamp with seven fraction digits** says "the fraction is optional" and does not say that at most six digits are read.
+- **The column name `DateUpdate` in the opening story and the SQL block** is a generic English name for a stamp column. Rename it to `LastEdited` in your own queries if a shorter, unique name suits you better.
 - **Keys that begin with a minus sign,** including negative integers such as `-3`, are written to
   `--out` with a guard apostrophe. The reader removes it from `--source` and `--applied`, and a
   spreadsheet shows the apostrophe.
