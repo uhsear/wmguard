@@ -32,6 +32,8 @@ wmguard self-test: temporary files only, no network, no credentials
 ...
 PASS  a watermark equal to a frozen base MAX, with the view ahead, is FROZEN  <-- pinned defect
 ...
+PASS  a job declared to read the view, with a mark behind a frozen base MAX, selects from the view and loses nothing: a note  <-- pinned defect
+...
 PASS  a base MAX inside the age limit that the view is ahead of is the normal state between compresses: a note, exit 0  <-- pinned defect
 ...
 PASS  an unapplied row inside the window is STRANDED  <-- pinned defect
@@ -62,6 +64,8 @@ PASS  an applied export that a spreadsheet guarded with an apostrophe still matc
 ...
 PASS  --out naming any other existing file is refused, not overwritten  <-- pinned defect
 ...
+PASS  the same file as --source and --applied is refused with exit 64, not read as every row applied and SAFE  <-- pinned defect
+...
 PASS  a credential file given by mistake never reaches stderr or stdout  <-- pinned defect
 ...
 PASS  a Windows-1252 export whose two keys would both decode to U+FFFD is refused and never reads SAFE  <-- pinned defect
@@ -77,10 +81,10 @@ PASS  --ap, a prefix of a write flag, is refused and writes nothing  <-- pinned 
 PASS  the module imports no network library, so it has no connection to leak a credential from  <-- pinned defect
 ...
 --------------------------------------------------------------------
-239 assertions, 0 failed
+245 assertions, 0 failed
 ```
 
-The full run prints all 239 assertions. Each `...` line above is where this block is cut.
+The full run prints all 245 assertions. Each `...` line above is where this block is cut.
 
 ## What already exists
 
@@ -120,10 +124,10 @@ day.
 
 Python 3.9 or newer and nothing else. No `arcpy`, no third-party package, no network, no database.
 
-The self-test prints the same 239 assertions on Windows (Python 3.13.2 and 3.12.10)
+The self-test prints the same 245 assertions on Windows (Python 3.13.2 and 3.12.10)
 and on Ubuntu (Python 3.9.25 and 3.12.3). The outputs are identical line for line, once the
 carriage returns that Windows adds are removed. `coverage run --branch wmguard.py --self-test`
-reports 100 percent of lines and branches (1010 statements, 172 branches).
+reports 100 percent of lines and branches (1037 statements, 176 branches).
 
 ```
 git clone https://github.com/uhsear/wmguard.git
@@ -273,12 +277,12 @@ stamp in the future is never old. The tool compares each stamp with `--now` and 
 
 | Code | Finding? | When |
 |---|---|---|
-| `FROZEN` | yes, exit 1 | The view MAX is ahead of the base MAX, the base MAX is older than `--max-age-hours`, and the mark is at or behind the base MAX. Also when the mark is above the base MAX and `--job-reads base` says the job reads the base table. |
+| `FROZEN` | yes, exit 1 | The view MAX is ahead of the base MAX, the base MAX is older than `--max-age-hours`, and the mark is at or behind the base MAX, unless `--job-reads view` says the job reads the view. Also when the mark is above the base MAX and `--job-reads base` says the job reads the base table. |
 | `READER` | yes, exit 1 | The view MAX is ahead, the base MAX is older than the limit, the mark is above the base MAX, and `--job-reads` was not given. The tool cannot see which table the job reads. |
 | `STALE` | yes, exit 1 | No view was given, and the base MAX is older than `--max-age-hours`. |
 | `FUTURE` | yes, exit 1 | The mark, the base MAX or the view MAX is more than 12 hours after `--now`. The tolerance is `FUTURE_TOLERANCE_HOURS` in the file; it allows for a database clock in another zone. One finding per stamp. |
 | `AHEAD` | yes, exit 1 | The mark is past every stamp the source has. A row stamped at or below it that arrives later is never selected. |
-| `BASE_LAGS` | note | The view MAX is ahead of the base MAX, but the base MAX is within the age limit, or the mark is above a stale base MAX and `--job-reads view` says the job reads the view. |
+| `BASE_LAGS` | note | The view MAX is ahead of the base MAX, but the base MAX is within the age limit, or the base MAX is stale and `--job-reads view` says the job reads the view, whether the mark is above the base MAX or at or behind it. |
 | `IDLE` | note | The base MAX is old, but the view is not ahead of it. The table is quiet. |
 | `FRESH` | note | The base MAX is recent, no stamp is more than 12 hours after `--now`, and the mark is not past the source. Without `--view-max` it also says a freeze younger than the limit was not looked for. |
 
@@ -286,8 +290,10 @@ stamp in the future is never old. The tool compares each stamp with `--now` and 
 and that the mark sits where a job reading the base table would put it. One snapshot cannot show
 that a table stopped moving. A blocked compress that is younger than `--max-age-hours` shows up as
 `BASE_LAGS` until it ages past the limit. A job that reads the view keeps a mark above the base
-MAX, so `--job-reads view` keeps it from being flagged. Without `--job-reads`, that mark is
-`READER`, a finding, because a job that reads the base table selects nothing above it.
+MAX, so `--job-reads view` keeps it from being flagged. A job that reads the view also selects the
+rows above a mark that sits at or behind the base MAX, so `--job-reads view` makes that a note
+too. Without `--job-reads`, a mark above the base MAX is `READER`, a finding, because a job that
+reads the base table selects nothing above it.
 
 The age limit is inclusive. A base MAX exactly at the limit is not stale, and one second over is.
 A stamp more than 12 hours after `--now` is `FUTURE`, a finding, and never `FRESH`. A stamp up to 12 hours after `--now` (the limit is inclusive) is treated as zone skew. A view MAX behind the base MAX is not freeze
@@ -499,7 +505,7 @@ source row look unapplied, and a scheduled job could not tell that from a real f
 | 1 | At least one finding. |
 | 2 | A file could not be read or is not UTF-8 text, or `--out` could not be written. |
 | 4 | Nothing was compared: no source row could be judged (each is `BEHIND`, `UNDATED` or absent), or no applied row was readable. |
-| 64 | Usage error: a bad flag, a bad stamp, a wrong-mode flag, an empty flag value, an existing `--out`, or a column the file lacks. |
+| 64 | Usage error: a bad flag, a bad stamp, a wrong-mode flag, an empty flag value, an existing `--out`, `--source` and `--applied` naming one file, or a column the file lacks. |
 | 70 | An unexpected crash in the tool. It is never a finding about the data. |
 
 Exit 4 is not exit 0 on purpose. A source that was exported with the wrong column, with every
@@ -680,8 +686,10 @@ stamp blank, or with every row at or below the old mark, would otherwise report 
 - **`IDLE` assumes every edit is stamped above the base MAX.** A clock that steps back, or a
   back-dated bulk load, can freeze a table while the view MAX is not ahead of the base MAX. The
   run then exits 0.
-- **Name two different files for `--source` and `--applied`.** The tool does not compare the two
-  paths. The same CSV given twice marks every row `APPLIED` and exits 0.
+- **Name two different files for `--source` and `--applied`.** The same file given twice, also as a
+  hard link or under another spelling of the path, exits 64 with "name the same file". A copy of
+  the source under another name is a different file. The tool reads it as an applied export, marks
+  every row `APPLIED` and exits 0.
 - **A sentinel stamp such as `9999-12-31` on a source row is read as a real stamp.** The row stays
   `PENDING` and `safemark` raises no `FUTURE` finding. `FUTURE` is judged only in `frozenmark`.
 - **A zero-byte `--applied` file exits 64, not a verdict.** A sync that applied nothing needs a
@@ -713,11 +721,13 @@ stamp blank, or with every row at or below the old mark, would otherwise report 
   OWASP aims at Excel. A different program may display the apostrophe as part of the key.
 - **Only the exact header of `--out` is recognised as the tool's own file.** If you rename a column
   or add one, the file is read as ordinary rows, and the hidden-stranded-rows problem above returns.
+- **A source or applied export whose columns are exactly `row`, `key`, `stamp` and `class` is taken
+  for wmguard's own `--out` file** and refused with exit 64; rename a column.
 - **A mark taken from the `_evw` view needs `--view-max`.** Without it, `frozenmark` compares the
   mark with the base MAX only, and a mark that is ahead of the base table reads as `AHEAD`
   (exit 1). Give `--view-max` and `--job-reads view` for a job that reads the view.
 - **`--job-reads` is ignored unless it is needed.** Given with a case that is not stale, or without `--view-max`, it changes nothing and prints no warning.
-- **`FROZEN` can be a conservative false alarm.** A job that reads the view, with a mark equal to a frozen base MAX while the view is ahead, is flagged with exit 1 even with `--job-reads view`, because the mark sits where a base-table reader would put it.
+- **`FROZEN` can be a conservative false alarm without `--job-reads`.** A job that reads the view, with a mark at or behind a frozen base MAX while the view is ahead, is flagged with exit 1, because the tool cannot see which table the job reads. Give `--job-reads view` and the same numbers are a `BASE_LAGS` note with exit 0.
 - **The `frozenmark` error for a stamp with seven fraction digits** says "the fraction is optional" and does not say that at most six digits are read.
 - **The column name `DateUpdate` in the opening story and the SQL block** is a generic English name for a stamp column. Rename it to `LastEdited` in your own queries if a shorter, unique name suits you better.
 - **Keys that begin with a minus sign,** including negative integers such as `-3`, are written to

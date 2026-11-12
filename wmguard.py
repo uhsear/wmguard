@@ -147,7 +147,9 @@ def judge_frozen(watermark, base_max, view_max, now, max_age, reads=None):
     from the base table. Only reads tells the tool whether the job selects
     from the view (a note) or from the base (FROZEN); with reads None it is
     the finding READER, because the tool cannot see which table the job
-    reads.
+    reads. A job that reads the view selects the rows above any mark from the
+    view, so reads "view" gives the note BASE_LAGS even when the mark sits at
+    or behind the base MAX.
     """
     out = []
     stale = now - base_max > max_age
@@ -155,7 +157,21 @@ def judge_frozen(watermark, base_max, view_max, now, max_age, reads=None):
         gap = hours(view_max - base_max)
         ahead = ("the view MAX %s is %.1f h ahead of the base MAX %s"
                  % (fmt_stamp(view_max), gap, fmt_stamp(base_max)))
-        if stale and watermark <= base_max:
+        if stale and reads == "view":
+            if watermark <= base_max:
+                where = ("The watermark is at or behind the base MAX, and "
+                         "--job-reads says the job reads the view, which "
+                         "holds the rows above it")
+            else:
+                where = ("The watermark is above the base MAX, so it did "
+                         "not come from the base table, and --job-reads "
+                         "says the job reads the view")
+            out.append(Finding(
+                "BASE_LAGS", False,
+                "%s, and the base MAX is %.1f h old. %s. Anything else that "
+                "reads the base table is stale."
+                % (ahead, hours(now - base_max), where)))
+        elif stale and watermark <= base_max:
             if watermark == base_max:
                 how = ("The watermark equals the base MAX, so a job that "
                        "reads the base table selects nothing")
@@ -168,14 +184,6 @@ def judge_frozen(watermark, base_max, view_max, now, max_age, reads=None):
                 "%s, and the base MAX is %.1f h old, over the limit of "
                 "%.1f h. %s." % (ahead, hours(now - base_max),
                                  hours(max_age), how)))
-        elif stale and reads == "view":
-            out.append(Finding(
-                "BASE_LAGS", False,
-                "%s, and the base MAX is %.1f h old. The watermark is above "
-                "the base MAX, so it did not come from the base table, and "
-                "--job-reads says the job reads the view. Anything else that "
-                "reads the base table is stale."
-                % (ahead, hours(now - base_max))))
         elif stale and reads == "base":
             out.append(Finding(
                 "FROZEN", True,
@@ -797,6 +805,14 @@ def _run_frozen(args):
     return code
 
 
+def _same_file(first, second):
+    try:
+        return os.path.samefile(first, second)
+    except OSError:
+        # A path that does not exist is reported by read_csv, with exit 2.
+        return False
+
+
 def _run_safe(args):
     old = _stamp_flag("old_watermark", args.old_watermark)
     new = _stamp_flag("new_watermark", args.new_watermark)
@@ -815,6 +831,12 @@ def _run_safe(args):
         # files, hard links to them and every other existing path.
         raise ValueError("--out %s already exists. wmguard never overwrites; "
                          "name a new file." % args.out)
+    if _same_file(args.source, args.applied):
+        # Every source row would be found in the applied file with the same
+        # stamp: APPLIED, SAFE, exit 0 for a sync that was never compared.
+        raise ValueError("--source and --applied name the same file, so "
+                         "every row would read as applied. Export the rows "
+                         "the sync applied into a separate file.")
     key = DEFAULT_KEY_FIELD if args.key_field is None else args.key_field
     stamp = (DEFAULT_STAMP_FIELD if args.stamp_field is None
              else args.stamp_field)
@@ -999,8 +1021,21 @@ def _self_test(tmp):
           "<-- pinned defect")
     f = frozen("2026-01-04 00:00:00", "2026-01-05 00:00:00",
                "2026-03-01 08:30:00", "2026-03-01 09:00:00", reads="view")
+    check(codes(f) == ["BASE_LAGS"] and not f[0].is_finding
+          and "reads the view, which holds the rows above it" in f[0].message
+          and gate(f, 1) == 0,
+          "a job declared to read the view, with a mark behind a frozen base "
+          "MAX, selects from the view and loses nothing: a note  "
+          "<-- pinned defect")
+    f = frozen("2026-01-05 00:00:00", "2026-01-05 00:00:00",
+               "2026-03-01 08:30:00", "2026-03-01 09:00:00", reads="view")
+    check(codes(f) == ["BASE_LAGS"] and not f[0].is_finding,
+          "and so is a view reader whose mark equals the frozen base MAX  "
+          "<-- pinned defect")
+    f = frozen("2026-01-04 00:00:00", "2026-01-05 00:00:00",
+               "2026-03-01 08:30:00", "2026-03-01 09:00:00", reads="base")
     check(codes(f) == ["FROZEN"],
-          "--job-reads view does not hide a mark behind a frozen base MAX")
+          "a base reader with a mark behind a frozen base MAX is still FROZEN")
     f = frozen("2026-03-01 08:00:00", "2026-03-01 08:00:00",
                "2026-03-01 08:20:00", "2026-03-01 08:30:00")
     check(codes(f) == ["BASE_LAGS"] and not f[0].is_finding
@@ -1684,6 +1719,31 @@ def _self_test(tmp):
           "<-- pinned defect")
     check(run_cli(sw + ["--out", tmp, "--apply"])[0] == 64,
           "and so is an existing directory")
+    same_sw = ["--old-watermark", "2026-03-01 00:00:00", "--new-watermark",
+               "2026-03-01 01:00:00"]
+    code, out, err = run_cli(
+        ["safemark", "--source", src_csv, "--applied", src_csv] + same_sw)
+    check(code == 64 and "same file" in err and out == "",
+          "the same file as --source and --applied is refused with exit 64, "
+          "not read as every row applied and SAFE  <-- pinned defect")
+    code, out, err = run_cli(
+        ["safemark", "--source", src_csv, "--applied",
+         os.path.join(tmp, ".", "source.csv")] + same_sw)
+    check(code == 64 and "same file" in err,
+          "and so is the same file under another spelling of its path")
+    linked = os.path.join(tmp, "source-link.csv")
+    os.link(src_csv, linked)
+    code, out, err = run_cli(
+        ["safemark", "--source", src_csv, "--applied", linked] + same_sw)
+    check(code == 64 and "same file" in err,
+          "and so is a hard link to it")
+    os.remove(linked)
+    gone = os.path.join(tmp, "gone.csv")
+    code, out, err = run_cli(
+        ["safemark", "--source", gone, "--applied", gone] + same_sw)
+    check(code == 2 and "error:" in err,
+          "the same missing path twice is a file error, exit 2, not a "
+          "verdict")
     linked = os.path.join(tmp, "source-link.csv")
     os.link(src_csv, linked)
     code, out, err = run_cli(sw + ["--out", linked, "--apply"])
