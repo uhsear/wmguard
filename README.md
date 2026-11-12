@@ -86,7 +86,7 @@ The full run prints all 226 assertions. Each `...` line above is where this bloc
 
 Data-loading libraries know the problem and handle it inside their own state. dlt's incremental
 cursor has a `lag` setting, which, in the documentation's words, "ensures that a defined period of
-data remains refreshed, capturing updates or changes within the attribution window." Its
+data remains refreshed". Its
 `on_cursor_value_missing` setting decides what happens to a row whose cursor is missing or `None`:
 the default raises, and the other two values include or exclude the row
 ([lag](https://dlthub.com/docs/general-usage/incremental/lag),
@@ -415,7 +415,8 @@ formula. OWASP lists those six characters, a line feed, and the full-width forms
 and `@`, and recommends to "Prepend each cell field with a single quote"
 ([CSV Injection](https://community.owasp.org/attacks/CSV_Injection)). The `key` column of
 `--out` comes from the source file, so `wmguard` puts one apostrophe in front of a key that starts
-with one of the six. It does not guard the line feed or the full-width forms (see Limits). OWASP
+with `=`, `+`, `-` or `@`. A tab or CR at the start of a key is trimmed away on read, so it never
+reaches the guard through the CLI (see Limits). It does not guard the line feed or the full-width forms (see Limits). OWASP
 also warns that these techniques "are not reliable in Microsoft Excel after saving and
 re-opening the CSV file", so this is a guard and not a proof.
 `=HYPERLINK("http://x.invalid","y")` is written as `'=HYPERLINK(...)`. Row numbers stay numbers.
@@ -496,9 +497,8 @@ stamp blank, or with every row at or below the old mark, would otherwise report 
   such as a Windows-1252 export with accented names, exits 2 and names the file, the byte and its
   offset. Nothing is decoded lossily, so two keys never collapse into one. A BOM at the start of a UTF-8 file is removed. A NUL
   byte inside a file gives exit 2 on Python 3.9 and 3.10, where the csv module refuses it, and is
-  read as part of the text on Python 3.11 and later. The change is the 3.11.0a2 entry "Add support
-  of null characters in csv" in the Python
-  [changelog](https://docs.python.org/3/whatsnew/changelog.html). A field over csv's default limit of 131072
+  read as part of the text on Python 3.11 and later. That was measured on 3.9, 3.10, 3.11 and 3.12,
+  and the cause in the csv module was not checked against the Python changelog. A field over csv's default limit of 131072
   characters gives exit 2 on every version. Its message does not name the file, so with two
   inputs you cannot tell from the message which one it was.
 - **An empty file is a usage error.** A zero-byte `--source` or `--applied` exits 64 with "columns
@@ -526,6 +526,23 @@ stamp blank, or with every row at or below the old mark, would otherwise report 
   one verdict. The other
   three columns are not guarded: the row number is an integer, the stamp comes from a parsed
   timestamp, and the class is one of five fixed words. Stdout is not a CSV and is not guarded.
+- **Keys that differ only by leading whitespace or one guard apostrophe are read as one key.** A
+  source key written as tab, CR or line feed followed by `=x`, or as `'=x`, reduces to `=x` and
+  shares one verdict with the key `=x`. A source key that starts with an apostrophe before `=`, `+`,
+  `-`, `@`, a tab or a CR can therefore match an applied key that differs only by that apostrophe.
+- **A key that starts with a tab or a CR is trimmed before it is written,** so the tab and CR guard
+  is exercised only by calling the function directly.
+- **An applied row whose stamp cannot be read is counted as not applied.** If its source row sits
+  above the new mark, the run can exit 0 with a `SAFE` line and a note that names the count. A
+  row at or below the new mark that is not applied becomes `STRANDED`, which exits 1.
+- **A two-column file given by mistake can print a value.** A `STRANDED` sample line prints the
+  key column, so a file whose key column holds a token puts that token on stdout. The self-test
+  pins only the case where the first line is the wrong header.
+- **A dry run does not test the `--out` directory.** A missing or read-only directory fails only
+  with `--apply`, as exit 2. A disk that fills during `--apply` leaves a partial `--out` file;
+  delete it before you run again.
+- **A readable file with the wrong columns exits 64, not 2.** A scheduler cannot tell a wrong flag
+  from a wrong-format file by the exit code alone.
 - **Some lead characters are not guarded.** A line feed is trimmed away before it can reach the
   guard. The full-width forms of `=`, `+`, `-` and `@` are written as they are. A zero-width space or
   a byte-order mark in front of `=` hides the formula character from the guard, so that key is
@@ -544,8 +561,8 @@ stamp blank, or with every row at or below the old mark, would otherwise report 
   the time line, so the printed safe mark ignores it. The `UNDATED` finding still exits 1. A
   blank-key row above the old mark does hold the safe mark below its own stamp.
 - **Keys and paths are printed as they are.** A key can hold a terminal escape sequence. The
-  traceback printed on exit 70 names the full path of the script and the files given on the command
-  line.
+  traceback printed on exit 70 names the path of the script and prints the source line of each
+  frame. It names a file given on the command line only when the exception message does.
 - **The GitHub search above cannot be repeated from this repository.** It is a dated claim.
 - **`--out` is written in place,** not through a temporary file. A failed write can leave a partial
   file, and the exit code is 2. The verdict is printed above the error. Delete the partial file
@@ -609,8 +626,8 @@ stamp blank, or with every row at or below the old mark, would otherwise report 
   written here. Do not rely on either result.
 - **The seven-digit precision of `datetime2(7)`** comes from the Microsoft page in Sources, which
   lists "0 to 7 digits" and says the type is not time zone offset aware.
-- **Excel may drop the apostrophe** when it saves the file again. OWASP names a tab prefix inside
-  the quoted field as an Excel-resistant alternative. The tool does not use it, because it would
+- **Excel may drop the apostrophe** when it saves the file again. OWASP also describes a tab prefix
+  inside the quoted field as an alternative. The tool does not use it, because it would
   change the key data.
 - **The guard covers `=`, `+`, `-`, `@`, tab and CR only.** A key that starts with a percent sign,
   a pipe or a zero-width character is written as it is.
