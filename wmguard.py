@@ -414,11 +414,15 @@ def later_keys(rows, verdicts, applied):
                    if v == APPLIED and applied[r.key] > newest[r.key]))
 
 
-def judge_safe(rows, applied, unreadable, old, new):
+def judge_safe(rows, applied, unreadable, old, new, now=None):
     """Judge the move of a watermark from old to new. Pure: no clock, no I/O.
 
     Only rows stamped above old are judged. unreadable is the count of applied
-    rows with no readable key and stamp."""
+    rows with no readable key and stamp. now, when given, is the time to
+    tell a sentinel stamp from a real one: a source stamp more than
+    FUTURE_TOLERANCE_HOURS after now (9999-12-31, say) is left out of the
+    newest-stamp reference of the AHEAD check, or it would hide AHEAD for
+    any mark."""
     verdicts = [classify_row(r, applied, old, new) for r in rows]
     safe = safe_watermark(rows, verdicts, old)
     if unreadable and not applied:
@@ -440,7 +444,9 @@ def judge_safe(rows, applied, unreadable, old, new):
             "read, so they are not judged. A NULL stamp is never greater "
             "than a mark, and a stamp in another format is not read."
             % undated))
-    dated = [r.stamp for r in rows if r.stamp is not None]
+    tolerance = datetime.timedelta(hours=FUTURE_TOLERANCE_HOURS)
+    dated = [r.stamp for r in rows if r.stamp is not None
+             and (now is None or r.stamp - now <= tolerance)]
     if dated and new > max(dated):
         findings.append(Finding(
             "AHEAD", True,
@@ -853,7 +859,8 @@ def _run_safe(args):
         return 2
     rows = build_source(source, key, stamp)
     applied, unreadable = build_applied(applied_rows, akey, astamp)
-    report = judge_safe(rows, applied, unreadable, old, new)
+    report = judge_safe(rows, applied, unreadable, old, new,
+                        datetime.datetime.now())
     print("wmguard safemark: %s %d row(s), %s %d row(s)"
           % (args.source, len(rows), args.applied, len(applied_rows)))
     for line in describe_safe(report, sample):
@@ -1260,6 +1267,36 @@ def _self_test(tmp):
           and gate(r.findings, r.compared) == 1,
           "a mark past every source stamp is AHEAD even when nothing is "
           "stranded, and it exits 1  <-- pinned defect")
+    sentinel = [row(1, "A", "2026-03-01 01:00:00"),
+                row(2, "Z", "9999-12-31 00:00:00")]
+    app_a = {"A": T("2026-03-01 01:00:00")}
+    r = judge_safe(sentinel, app_a, 0, old, new)
+    check(codes(r.findings) == ["SAFE"],
+          "without a clock a 9999 stamp is the newest stamp, so AHEAD "
+          "stays silent")
+    r = judge_safe(sentinel, app_a, 0, old, T("2026-11-13 00:00:00"),
+                   T("2026-11-13 00:00:00"))
+    check(codes(r.findings) == ["AHEAD"] and r.findings[0].is_finding
+          and "newest source stamp 2026-03-01 01:00:00" in
+          r.findings[0].message,
+          "a sentinel 9999 stamp does not hide a wall-clock mark: AHEAD "
+          "names the newest real stamp  <-- pinned defect")
+    r = judge_safe(sentinel, app_a, 0, old, T("2099-01-01 00:00:00"),
+                   T("2026-11-13 00:00:00"))
+    check(codes(r.findings) == ["AHEAD"],
+          "and a mark in 2099 is AHEAD of the real stamps too  <-- "
+          "pinned defect")
+    r = judge_safe(sentinel[:1] + [row(2, "Z", "2026-11-13 12:00:00")],
+                   app_a, 0, old, T("2026-11-13 12:00:00"),
+                   T("2026-11-13 00:00:00"))
+    check("AHEAD" not in codes(r.findings),
+          "a stamp exactly 12 h after now is zone skew, not a sentinel, "
+          "so it stays in the reference")
+    r = judge_safe([row(1, "Z", "9999-12-31 00:00:00")], {}, 0, old, new,
+                   T("2026-11-13 00:00:00"))
+    check("AHEAD" not in codes(r.findings),
+          "a source of sentinel stamps alone has no real stamp to be "
+          "ahead of, so no AHEAD")
     r = judge([("A", "2026-03-01 01:00:00"), ("B", None)],
               {"A": T("2026-03-01 01:00:00")},
               n=T("2026-03-01 01:00:00"))
@@ -1568,6 +1605,17 @@ def _self_test(tmp):
     code, out, err = run_cli(sw[:-1] + ["2026-03-01 09:00:00"])
     check(code == 1 and "AHEAD" in out,
           "a new mark past the source is AHEAD on the CLI")
+    sen_src = tmpfile("sentinel-source.csv", "KEY,STAMP\nA,2026-03-01 01:00:00\n"
+                      "Z,9999-12-31 00:00:00\n")
+    sen_app = tmpfile("sentinel-applied.csv",
+                      "KEY,STAMP\nA,2026-03-01 01:00:00\n")
+    code, out, err = run_cli(
+        ["safemark", "--source", sen_src, "--applied", sen_app,
+         "--old-watermark", "2026-03-01 00:00:00", "--new-watermark",
+         "2026-03-01 09:00:00"])
+    check(code == 1 and "AHEAD" in out and "2026-03-01 01:00:00" in out,
+          "a 9999-12-31 row in the source does not hide a mark past the "
+          "real stamps on the CLI  <-- pinned defect")
     ok_src = tmpfile("ok-source.csv", "KEY,STAMP\nA,2026-03-01 01:00:00\n")
     ok_app = tmpfile("ok-applied.csv", "KEY,STAMP\nA,2026-03-01 01:00:00\n")
     ok = ["safemark", "--source", ok_src, "--applied", ok_app,

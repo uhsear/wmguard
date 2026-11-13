@@ -36,6 +36,8 @@ PASS  a job declared to read the view, with a mark behind a frozen base MAX, sel
 ...
 PASS  a base MAX inside the age limit that the view is ahead of is the normal state between compresses: a note, exit 0  <-- pinned defect
 ...
+PASS  a mark poisoned by one future-dated row reads FUTURE on the watermark, the base MAX and the view MAX, and never FRESH  <-- pinned defect
+...
 PASS  an unapplied row inside the window is STRANDED  <-- pinned defect
 ...
 PASS  a row in the window with a blank key is UNDATED, never guessed APPLIED  <-- pinned defect
@@ -44,10 +46,9 @@ PASS  an unapplied row above the new mark (PENDING) also caps the safe mark: it 
 ...
 PASS  a mark past every source stamp is AHEAD even when nothing is stranded, and it exits 1  <-- pinned defect
 ...
-PASS  a mark poisoned by one future-dated row reads FUTURE on the watermark, the base MAX and the view MAX, and never FRESH  <-- pinned defect
+PASS  a sentinel 9999 stamp does not hide a wall-clock mark: AHEAD names the newest real stamp  <-- pinned defect
 ...
 PASS  a source with no readable stamp compared nothing: exit 4, not clean  <-- pinned defect
-...
 PASS  rows all at or below the old mark are BEHIND, not compared: exit 4, no SAFE finding  <-- pinned defect
 ...
 PASS  an unapplied row at or below the old mark is a finding, not a clean exit 0 over a row the tool could not judge  <-- pinned defect
@@ -81,10 +82,10 @@ PASS  --ap, a prefix of a write flag, is refused and writes nothing  <-- pinned 
 PASS  the module imports no network library, so it has no connection to leak a credential from  <-- pinned defect
 ...
 --------------------------------------------------------------------
-245 assertions, 0 failed
+251 assertions, 0 failed
 ```
 
-The full run prints all 245 assertions. Each `...` line above is where this block is cut.
+The full run prints all 251 assertions. Each `...` line above stands for the lines of the run that this block cuts out. The quoted lines keep the order of the run.
 
 ## What already exists
 
@@ -124,10 +125,10 @@ day.
 
 Python 3.9 or newer and nothing else. No `arcpy`, no third-party package, no network, no database.
 
-The self-test prints the same 245 assertions on Windows (Python 3.13.2 and 3.12.10)
+The self-test prints the same 251 assertions on Windows (Python 3.13.2 and 3.12.10)
 and on Ubuntu (Python 3.9.25 and 3.12.3). The outputs are identical line for line, once the
 carriage returns that Windows adds are removed. `coverage run --branch wmguard.py --self-test`
-reports 100 percent of lines and branches (1037 statements, 176 branches).
+reports 100 percent of lines and branches (1054 statements, 176 branches).
 
 ```
 git clone https://github.com/uhsear/wmguard.git
@@ -255,7 +256,8 @@ With `--job-reads view` the same numbers print a `BASE_LAGS` note and exit 0. Wi
 above a mark that sits above the base MAX, and exit 1.
 
 When no `--view-max` is given and the base MAX is inside the age limit, the tool cannot look for
-a freeze that began less than that long ago. It exits 0 and says what it did not do:
+a freeze that began less than that long ago. It exits 0 and says what it did not do. Pass
+`--view-max` when you can: exit 0 without it does not rule out a freeze younger than the limit.
 
 ```
 $ python wmguard.py frozenmark --watermark "2026-03-01 00:00:00" --base-max "2026-03-01 00:00:00" --now "2026-03-01 20:00:00"
@@ -460,7 +462,7 @@ Other findings of this mode:
 |---|---|---|
 | `STRANDED` | yes, exit 1 | At least one row is `STRANDED`. The message gives a safe mark. |
 | `UNDATED` | yes, exit 1 | At least one source row has a blank key or a stamp the tool cannot read. |
-| `AHEAD` | yes, exit 1 | The new mark is past the newest source stamp. This fires when no row is stranded. A mark set to the wall clock, and not to a data value, does this. |
+| `AHEAD` | yes, exit 1 | The new mark is past the newest source stamp. This fires when no row is stranded. A mark set to the wall clock, and not to a data value, does this. A source stamp more than 12 hours after this machine's clock, such as `9999-12-31`, is left out of the newest-stamp reference, so a sentinel row does not hide it. |
 | `REGRESSED` | note | The new mark is behind the old one. Rows between them are selected twice and none is lost. |
 | `OUTSIDE` | yes, exit 1 | At least one row at or below the old mark is not in the applied file. This run does not judge it, and it cannot tell a skipped row from one never meant to be applied. |
 | `SAFE` | note | None of the findings or notes above, and at least one row was judged in the window (not `BEHIND`, not `UNDATED`). |
@@ -483,6 +485,15 @@ reaches the guard through the CLI (see Limits). It does not guard the line feed 
 also warns that these techniques "are not reliable in Microsoft Excel after saving and
 re-opening the CSV file", so this is a guard and not a proof.
 `=HYPERLINK("http://x.invalid","y")` is written as `'=HYPERLINK(...)`. Row numbers stay numbers.
+A real run with that key as the second source row and `--apply --out g-out.csv` wrote this file
+(the line endings are CRLF):
+
+```
+row,key,stamp,class
+1,A,2026-03-01 01:00:00,APPLIED
+2,"'=HYPERLINK(""http://x.invalid"",""y"")",2026-03-01 02:00:00,PENDING
+```
+
 The reader removes one guard apostrophe from the key column of `--source` and `--applied`, so an
 applied export that a spreadsheet saved with the apostrophe still matches the source key. The
 tool refuses its own `--out` file as `--source` or `--applied`, with exit 64. The file lists every
@@ -680,7 +691,8 @@ stamp blank, or with every row at or below the old mark, would otherwise report 
   so the strip-on-read of the guard apostrophe is pinned through `uncell(cell(v)) == v` and
   through an applied export that a spreadsheet guarded, and not through a file written then read.
 - **Stamps without seconds and `datetime2(7)` values are `UNDATED`.** `2026-03-01 01:00` and a
-  value with seven fraction digits are not read. A file of only such stamps exits 4 with "nothing
+  value with seven fraction digits are not read. Trim the stamp column of the export to
+  six fraction digits or fewer, which this tool does not do for you, to make them readable. A file of only such stamps exits 4 with "nothing
   was compared". The stamp tick of 3 ms for `datetime` is an approximation: it rounds to .000,
   .003 and .007 seconds, so the spacing is not even.
 - **`IDLE` assumes every edit is stamped above the base MAX.** A clock that steps back, or a
@@ -690,8 +702,12 @@ stamp blank, or with every row at or below the old mark, would otherwise report 
   hard link or under another spelling of the path, exits 64 with "name the same file". A copy of
   the source under another name is a different file. The tool reads it as an applied export, marks
   every row `APPLIED` and exits 0.
-- **A sentinel stamp such as `9999-12-31` on a source row is read as a real stamp.** The row stays
-  `PENDING` and `safemark` raises no `FUTURE` finding. `FUTURE` is judged only in `frozenmark`.
+- **A sentinel stamp such as `9999-12-31` on a source row is read as a real stamp,** except for the
+  `AHEAD` check. The row stays `PENDING` and `safemark` raises no `FUTURE` finding. `FUTURE` is
+  judged only in `frozenmark`. For `AHEAD`, `safemark` leaves out any source stamp more than 12
+  hours after this machine's clock (there is no `--now` for `safemark`), so the newest real stamp
+  is the reference. A sentinel that is not in the future of that clock still counts as the newest
+  stamp.
 - **A zero-byte `--applied` file exits 64, not a verdict.** A sync that applied nothing needs a
   header-only applied file to get a verdict.
 - **A file that does not name itself in a csv error.** A NUL byte or a BOM-less UTF-16 file on
