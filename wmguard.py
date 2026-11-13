@@ -1839,8 +1839,8 @@ def _self_test(tmp):
                               "--new-watermark", "2026-03-02"])
     check(code == 64 and "abc123xyz" not in err and "API_TOKEN" not in err
           and "It has 1 column(s)" in err and out == "",
-          "a credential file given by mistake never reaches stderr or "
-          "stdout  <-- pinned defect")
+          "a file with no matching header, given by mistake, never has its "
+          "first line printed to stderr or stdout  <-- pinned defect")
     code, out, err = run_cli(base + ["--key-field", "ID", "--stamp-field",
                                      "UPDATED", "--applied-stamp-field",
                                      "SERVED"])

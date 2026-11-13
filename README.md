@@ -67,7 +67,7 @@ PASS  --out naming any other existing file is refused, not overwritten  <-- pinn
 ...
 PASS  the same file as --source and --applied is refused with exit 64, not read as every row applied and SAFE  <-- pinned defect
 ...
-PASS  a credential file given by mistake never reaches stderr or stdout  <-- pinned defect
+PASS  a file with no matching header, given by mistake, never has its first line printed to stderr or stdout  <-- pinned defect
 ...
 PASS  a Windows-1252 export whose two keys would both decode to U+FFFD is refused and never reads SAFE  <-- pinned defect
 ...
@@ -126,9 +126,10 @@ day.
 Python 3.9 or newer and nothing else. No `arcpy`, no third-party package, no network, no database.
 
 The self-test prints the same 251 assertions on Windows (Python 3.13.2 and 3.12.10)
-and on Ubuntu (Python 3.9.25 and 3.12.3). The outputs are identical line for line, once the
+and on Ubuntu (Python 3.12.3 from the distribution, and 3.9.25 from a uv-managed interpreter, because stock Ubuntu 24.04 ships 3.12). The outputs are identical line for line, once the
 carriage returns that Windows adds are removed. `coverage run --branch wmguard.py --self-test`
-reports 100 percent of lines and branches (1054 statements, 176 branches).
+reports 100 percent of lines and branches (1054 statements, 176 branches). Coverage was measured
+on Windows only; the Linux host has no `coverage` module.
 
 ```
 git clone https://github.com/uhsear/wmguard.git
@@ -588,7 +589,9 @@ stamp blank, or with every row at or below the old mark, would otherwise report 
 - **A wrong column name never echoes the header.** The message names the columns you asked for and
   counts the columns the file has, so a file given by mistake, such as one that holds a token in
   its first line, does not reach the log. A count of 1 usually means the file is not
-  comma-separated. The self-test pins that a credential-shaped first line is not printed.
+  comma-separated. The self-test pins that the first line of a file without the expected header is not printed. A
+  file that has the expected columns and holds a secret in its key column is printed through the
+  sample lines, as the next bullets say.
 - **Control characters in a key are printed as they are.** A key that holds an escape sequence or a
   newline can change what the console shows.
 - **Row numbers count CSV records.** A blank line or a quoted newline moves them away from the line
@@ -597,9 +600,9 @@ stamp blank, or with every row at or below the old mark, would otherwise report 
   `@`, a tab or a CR with one apostrophe in front, and the reader removes exactly one such
   apostrophe from the key column of `--source` and `--applied`. A source key that is already
   written as an apostrophe followed by one of those characters, such as `'=x`, is therefore read
-  as `=x` and written as `'=x`. That is the one key the file does not copy byte for byte, so the
-  guard is lossless for every key except one that already starts with an apostrophe followed by
-  one of those characters. Keys are
+  as `=x` and written as `'=x`. A key that already starts with an apostrophe
+  followed by one of those characters is the one key that the guard changes. The key in `--out` is
+  also the trimmed key, so leading or trailing whitespace is not copied byte for byte. Keys are
   trimmed before they are written, so a tab or CR at the start of a key never reaches the guard
   through the CLI. The guard still covers both, and the self-test calls it with both. The guard covers
   these six characters only, and only after the key is trimmed. Two source
@@ -611,8 +614,12 @@ stamp blank, or with every row at or below the old mark, would otherwise report 
   source key written as tab, CR or line feed followed by `=x`, or as `'=x`, reduces to `=x` and
   shares one verdict with the key `=x`. A source key that starts with an apostrophe before `=`, `+`,
   `-`, `@`, a tab or a CR can therefore match an applied key that differs only by that apostrophe.
-- **A key that starts with a tab or a CR is trimmed before it is written,** so the tab and CR guard
-  is exercised only by calling the function directly.
+- **A key that starts with a tab or a CR is trimmed before it is written.** Leading tab, CR and
+  other whitespace is trimmed from a key before it is written, so the tab and CR guard only acts
+  when `cell()` is called directly.
+- **The guard differs from the `xwddiff` one in one case.** `wmguard` also guards a value that
+  starts with an apostrophe before a formula character, so `cell("'=x")` is `''=x`. That keeps
+  `uncell(cell(v)) == v` true. The `xwddiff` function leaves `'=x` as it is.
 - **An applied row whose stamp cannot be read is counted as not applied.** If its source row sits
   above the new mark, the run can exit 0 with a `SAFE` line and a note that names the count. A
   row at or below the new mark that is not applied becomes `STRANDED`, which exits 1.
@@ -687,7 +694,8 @@ stamp blank, or with every row at or below the old mark, would otherwise report 
   was applied with the same stamp, and the run can exit 0 with a `SAFE` line. If the applied stamp
   is later than the source stamp, the `LATER` finding fires and the run exits 1. Keys of that
   shape are rare.
-- **No path writes a file and reads it back.** `wmguard` refuses its own `--out` file with exit 64,
+- **The guard round trip is pinned at function level and against a hand-written guarded export,
+  not through a file the tool wrote itself.** No path writes a file and reads it back. `wmguard` refuses its own `--out` file with exit 64,
   so the strip-on-read of the guard apostrophe is pinned through `uncell(cell(v)) == v` and
   through an applied export that a spreadsheet guarded, and not through a file written then read.
 - **Stamps without seconds and `datetime2(7)` values are `UNDATED`.** `2026-03-01 01:00` and a
@@ -780,8 +788,9 @@ stamp blank, or with every row at or below the old mark, would otherwise report 
   named `wmguard-selftest-*` in the temp folder. Delete any that remain.
 - **The compress-to-delta-table behaviour in the opening** is an inference from the Esri pages in
   Sources, not a quoted statement.
-- It opens no socket and imports no network module, so no credential can leak from it. The
-  self-test reads its own source to assert that.
+- It opens no socket and imports no network module, so it sends nothing anywhere. It can still
+  print the keys it reads (see "Keys are printed to the log"). The self-test reads its own source
+  to assert that no network module is imported.
 
 ## Sources
 
