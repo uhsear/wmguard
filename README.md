@@ -525,6 +525,9 @@ stamp blank, or with every row at or below the old mark, would otherwise report 
 
 ## Limits
 
+- **The guard example in `safemark` names no marks, so it is not reproducible as printed.** Its
+  second row is `PENDING` only when `--new-watermark` is below `2026-03-01 02:00:00`. With the new
+  mark `2026-03-01 06:00:00` the same row is `STRANDED`. The applied file lists only key `A`.
 - **The freeze itself is not reproduced.** No ArcGIS Enterprise geodatabase or SQL Server was
   available for this build. The tool judges the numbers you give it. It does not check that
   `--view-max` really came from a view, or that the base table was ever versioned. The behaviour
@@ -547,7 +550,8 @@ stamp blank, or with every row at or below the old mark, would otherwise report 
   compare exactly.
 - **Other stamp formats are `UNDATED`.** Esri-formatted dates such as `3/1/2026 1:00:00 AM`, and
   epoch milliseconds, are not parsed. Convert them to `YYYY-MM-DD HH:MM:SS` in the export query.
-  When every source stamp is in one of those formats, the run exits 4.
+  When every source stamp is in one of those formats, the run exits 4. A stamp written with
+  full-width digits is read as the same number, because `strptime` accepts them.
 - **The exports must come from one moment.** A row edited between the `--source` export and the
   `--applied` export looks stranded or pending. Export both right after the sync, in one
   transaction if you can.
@@ -767,7 +771,8 @@ stamp blank, or with every row at or below the old mark, would otherwise report 
   [Naming Files, Paths, and Namespaces](https://learn.microsoft.com/en-us/windows/win32/fileio/naming-a-file)
   lists `CON`, `PRN`, `AUX` and `NUL` as reserved names and says to avoid them "followed immediately
   by an extension", so `aux.csv` is a name that page tells you not to use, even though it was
-  written here. Do not rely on either result.
+  written here. Do not rely on either result. An `--out` name that addresses an alternate data
+  stream (`new.csv:stream`) or a reserved device other than `NUL` is not specially refused.
 - **The seven-digit precision of `datetime2(7)`** comes from the Microsoft page in Sources, which
   lists "0 to 7 digits" and says the type is not time zone offset aware.
 - **Excel may drop the apostrophe** when it saves the file again. OWASP also describes a tab prefix
